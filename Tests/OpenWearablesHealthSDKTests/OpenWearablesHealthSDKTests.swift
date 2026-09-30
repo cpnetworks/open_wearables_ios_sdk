@@ -122,6 +122,20 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertTrue(mapped.contains { $0.identifier == HKQuantityTypeIdentifier.dietaryProtein.rawValue })
     }
 
+    func testAuthorizationOmitsFoodCorrelationButSyncStillQueriesIt() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let previous = sdk.trackedTypes
+        defer { sdk.trackedTypes = previous }
+
+        sdk.trackedTypes = sdk.mapTypes([.dietaryEnergyConsumed, .steps, .bloodPressure])
+        let authorized = sdk.typesForAuthorization()
+
+        XCTAssertFalse(authorized.contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+        XCTAssertFalse(authorized.contains { $0.identifier == HKCorrelationTypeIdentifier.bloodPressure.rawValue })
+        XCTAssertTrue(authorized.contains { $0.identifier == HKQuantityTypeIdentifier.dietaryEnergyConsumed.rawValue })
+        XCTAssertTrue(sdk.getQueryableTypes().contains { $0.identifier == HKCorrelationTypeIdentifier.food.rawValue })
+    }
+
     func testFoodCorrelationEmitsParentAndChildrenInRecords() {
         let start = Date(timeIntervalSince1970: 1_779_163_200) // 2026-05-18-ish just a fixed date
         let energyType = HKQuantityType.quantityType(forIdentifier: .dietaryEnergyConsumed)!
