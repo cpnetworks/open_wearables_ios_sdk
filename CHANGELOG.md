@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+* **Outdoor workout routes** (Map Roadmap #27): `HealthDataType.workoutRoute` authorizes and syncs `HKWorkoutRoute` GPS tracks for outdoor workouts. A route-only authorization request can no longer be constructed — HealthKit requires `HKObjectType.workoutType()` in the same read set or throws an uncaught `NSInvalidArgumentException`; `normalizedTypesForAuthorization` enforces the pairing structurally. Route content is excluded from the generic per-type sync loop (`getSyncableTypes()`) and instead fetched per-workout via `HKQuery.predicateForObjects(from:)` — never a time/distance re-match — so a route can never attach to the wrong workout. An indoor workout or one with no recorded route is unaffected; `route` stays `null` exactly as before.
+
 ## 0.15.0
 
 * **Cycling power and cadence** (#44): authorize and sync `cyclingPower`, `cyclingCadence`, `cyclingSpeed`, and `cyclingFunctionalThresholdPower` (iOS 17+) as quantity samples — the same path as `heartRate` / `runningPower` — so Bluetooth power-meter timeseries and Apple Watch cycling workouts actually reach the backend. Workout-level averages for power, cadence and speed are populated from `HKWorkout` statistics.
