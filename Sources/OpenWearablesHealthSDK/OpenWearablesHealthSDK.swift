@@ -251,6 +251,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var protectedDataAvailableOverrideForTests: Bool?
     internal var routeRetryLookupOverrideForTests: ((UUID, @escaping (HKWorkout?, [[String: Any]]?) -> Void) -> Void)?
 
+    #if DEBUG
+    /// Map Roadmap #27 Stage F bounded real-device proof ONLY - see
+    /// `armForcedRouteFetchMiss`. `#if DEBUG` means this property, and
+    /// the branch in `fetchRoutePayload` that reads it, do not exist in
+    /// the compiled code of a Release build (verified by inspecting a
+    /// Release build's binary) - there is no runtime flag to disable,
+    /// because there is nothing to disable.
+    internal var forcedRouteMissAfterForDebugProof: Date?
+    #endif
+
     /// Root for `outboxDir()` and `syncStateDir()`.
     internal func stateBaseDirectory() -> URL {
         if let stateDirectoryOverride = stateDirectoryOverride {
@@ -1327,6 +1337,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// delayed route is found via the IDENTICAL query shape that eventually
     /// finds it, never a second, divergent implementation.
     internal func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
+        #if DEBUG
+        // Map Roadmap #27 Stage F bounded proof ONLY - see
+        // armForcedRouteFetchMiss's own doc comment. Wrapped in #if DEBUG
+        // so this entire branch, and the property it reads, are absent
+        // from the compiled code of a Release build - not merely
+        // disabled at runtime. Fires at most once: the moment it matches
+        // a workout it clears itself, so every call after this one -
+        // including this same workout's own later retry - runs the real,
+        // unmodified query below.
+        if let armedAfter = forcedRouteMissAfterForDebugProof, workout.startDate >= armedAfter {
+            forcedRouteMissAfterForDebugProof = nil
+            logMessage("DEBUG: forcing route fetch miss for workout \(workout.uuid.uuidString) (Stage F proof)")
+            recordPendingRouteRetryIfNeeded(for: workout)
+            completion(nil)
+            return
+        }
+        #endif
         let predicate = HKQuery.predicateForObjects(from: workout)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samplesOrNil, error in
