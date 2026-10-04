@@ -41,7 +41,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Shared singleton instance.
     public static let shared = OpenWearablesHealthSDK()
     
-    internal static let sdkVersion = "0.16.0"
+    internal static let sdkVersion = "0.17.0"
     
     // MARK: - Public Callbacks
     
@@ -243,6 +243,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// nil and resolves to Application Support; tests point it at a temporary directory
     /// so a test run cannot read or delete the state of the app hosting it.
     internal var stateDirectoryOverride: URL?
+
+    /// Map Roadmap #27 Stage F test seams (RouteRetry.swift). Production leaves both
+    /// nil: `UIApplication.shared.isProtectedDataAvailable` cannot be flipped to false
+    /// from a test, and a workout built with `HKWorkout`'s in-memory initializer was
+    /// never actually saved to the HealthKit store a real query would hit.
+    internal var protectedDataAvailableOverrideForTests: Bool?
+    internal var routeRetryLookupOverrideForTests: ((UUID, @escaping (HKWorkout?, [[String: Any]]?) -> Void) -> Void)?
 
     /// Root for `outboxDir()` and `syncStateDir()`.
     internal func stateBaseDirectory() -> URL {
@@ -790,6 +797,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.syncAll(fullExport: false) {
+                // Map Roadmap #27 Stage F - the dominant real-world
+                // opportunity: an observer-fired sync right after a new
+                // workout is exactly when a just-missed route is most
+                // likely to have finished writing by now. Piggybacked here
+                // rather than on a dedicated timer - see RouteRetry.swift's
+                // own header for why.
+                self.retryPendingRoutesIfPossible()
                 if self.observerBgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(self.observerBgTask)
                     self.observerBgTask = .invalid
@@ -1308,12 +1322,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// so a client-side ordering bug can never silently corrupt the stored
     /// sequence - this is just the one place that knows which
     /// HKWorkoutRoute object came first.
-    private func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
+    /// `internal`, not `private` - Stage F's pending-route retry
+    /// (RouteRetry.swift) calls this same query for its own re-check, so a
+    /// delayed route is found via the IDENTICAL query shape that eventually
+    /// finds it, never a second, divergent implementation.
+    internal func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
         let predicate = HKQuery.predicateForObjects(from: workout)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samplesOrNil, error in
             guard let self = self else { completion(nil); return }
             guard let routes = samplesOrNil as? [HKWorkoutRoute], error == nil, !routes.isEmpty else {
+                // Map Roadmap #27 Stage F - a miss here is NOT authoritative
+                // evidence of "no route": HKWorkoutRoute can lag the parent
+                // HKWorkout's own availability by more than this query's
+                // own timing margin (empirically observed >4.6s, <27min on
+                // a real Apple Watch recording). Track it for a bounded,
+                // independent retry rather than treating this as the final
+                // answer - the workout itself still syncs normally this
+                // round regardless (see fetchRoutePayloads's own doc
+                // comment: this method never blocks the workout's own
+                // upload on route availability).
+                self.recordPendingRouteRetryIfNeeded(for: workout)
                 completion(nil)
                 return
             }
@@ -1913,7 +1942,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         ) { [weak self] _ in
             guard let self = self else { return }
             self.logMessage("Device unlocked - protected data available")
-            
+
+            // Map Roadmap #27 Stage F - unlock is the first real opportunity
+            // after a lock-screen gap during which a retry could not even
+            // query HealthKit; independent of whether a full sync resumes.
+            self.retryPendingRoutesIfPossible()
+
             if self.pendingSyncAfterUnlock {
                 self.pendingSyncAfterUnlock = false
                 self.logMessage("Triggering deferred sync after unlock...")
@@ -1978,7 +2012,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private func tryResumeAfterForeground() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             guard let self = self else { return }
-            
+
+            // Map Roadmap #27 Stage F - unconditional, independent of
+            // whether a full workout sync has anything to resume below:
+            // route retry is its own bounded, opportunistic process, not
+            // part of the workout anchor's resume logic.
+            self.retryPendingRoutesIfPossible()
+
             guard OpenWearablesHealthSdkKeychain.isSyncActive(), self.hasAuth else { return }
             
             let fullDone = self.defaults.bool(forKey: self.fullDoneKey())

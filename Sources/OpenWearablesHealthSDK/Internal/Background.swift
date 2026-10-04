@@ -121,6 +121,12 @@ extension OpenWearablesHealthSDK {
             
             self?.retryOutboxIfPossible()
             self?.collectAllData(fullExport: false, isBackground: true) {
+                // Map Roadmap #27 Stage F - the longer-horizon opportunity:
+                // BGProcessingTask already requires network connectivity
+                // (req.requiresNetworkConnectivity above), so this is a
+                // reliable place for the ~5m/~30m backoff steps to land
+                // even when the app is never foregrounded again soon.
+                self?.retryPendingRoutesIfPossible()
                 group.leave()
             }
             

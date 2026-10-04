@@ -28,6 +28,8 @@ extension XCTestCase {
         let previousCredentials = OpenWearablesHealthSdkKeychain.volatileStore
         let previousPersistedHost = OpenWearablesHealthSdkKeychain.getHost()
         let previousRefreshUrl = OpenWearablesHealthSdkKeychain.getCustomRefreshUrl()
+        let previousProtectedDataOverride = sdk.protectedDataAvailableOverrideForTests
+        let previousRouteRetryLookupOverride = sdk.routeRetryLookupOverrideForTests
 
         let stateDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ow-sdk-tests-\(UUID().uuidString)", isDirectory: true)
@@ -45,10 +47,19 @@ extension XCTestCase {
             OpenWearablesHealthSdkKeychain.volatileStore = previousCredentials
             OpenWearablesHealthSdkKeychain.saveHost(previousPersistedHost)
             OpenWearablesHealthSdkKeychain.saveCustomRefreshUrl(previousRefreshUrl)
+            sdk.protectedDataAvailableOverrideForTests = previousProtectedDataOverride
+            sdk.routeRetryLookupOverrideForTests = previousRouteRetryLookupOverride
             try? FileManager.default.removeItem(at: stateDirectory)
         }
 
         sdk.stateDirectoryOverride = stateDirectory
+        // The xctest host process itself reports isProtectedDataAvailable
+        // == false (no foreground app, no unlocked-device concept at all),
+        // so a test that wants the "normal" path must not fall through to
+        // the real value - default to true here and let the one test that
+        // exercises the unavailable branch override it to false locally.
+        sdk.protectedDataAvailableOverrideForTests = true
+        sdk.routeRetryLookupOverrideForTests = nil
         sdk.foregroundSession = URLSession(
             configuration: configuration, delegate: nil, delegateQueue: .main
         )

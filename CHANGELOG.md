@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.17.0
+
+* **Apple route availability race remediation** (Map Roadmap #27 Stage F): a `HKWorkoutRoute` is not always locally available the instant its parent `HKWorkout` is delivered via the anchored/observer sync — confirmed on a real device, a route was still missing 4.6s after the workout ended but fully present ~27 minutes later. A miss in `fetchRoutePayload` is no longer final: it is tracked in a small persisted, bounded retry queue (`pending_apple_route_retries.json`) and re-checked opportunistically (observer-driven sync, foreground, device unlock, `BGProcessingTask`) on a ~15s/1m/5m/30m backoff, capped at 4 attempts or 24h. The workout itself still syncs promptly either way — this never gates or delays it. A route found on retry is resent as an ordinary one-workout sync payload; the server's existing natural-key resolution attaches it to the same `EventRecord`, so no duplicate workout or route is ever created.
+
 ## 0.16.0
 
 * **Outdoor workout routes** (Map Roadmap #27): `HealthDataType.workoutRoute` authorizes and syncs `HKWorkoutRoute` GPS tracks for outdoor workouts. A route-only authorization request can no longer be constructed — HealthKit requires `HKObjectType.workoutType()` in the same read set or throws an uncaught `NSInvalidArgumentException`; `normalizedTypesForAuthorization` enforces the pairing structurally. Route content is excluded from the generic per-type sync loop (`getSyncableTypes()`) and instead fetched per-workout via `HKQuery.predicateForObjects(from:)` — never a time/distance re-match — so a route can never attach to the wrong workout. An indoor workout or one with no recorded route is unaffected; `route` stays `null` exactly as before.
