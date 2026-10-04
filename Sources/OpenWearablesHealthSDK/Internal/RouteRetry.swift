@@ -42,24 +42,39 @@ extension OpenWearablesHealthSDK {
         var attemptCount: Int
     }
 
-    /// Minimum elapsed time (since `lastAttemptAt`, or `firstMissedAt` if
-    /// never attempted) before attempt N is eligible. Not derived from the
-    /// single 27-minute diagnostic observation - deliberately front-loaded
-    /// so the common case (route finishes writing within a minute or two,
-    /// while the user is still actively using the phone right after a
-    /// workout) resolves via the ordinary observer-driven syncs that are
-    /// already firing repeatedly in that window, with the longer steps as
-    /// a backstop for the slow/backgrounded case.
-    internal static let routeRetryBackoff: [TimeInterval] = [15, 60, 300, 1800]
+    /// Map Roadmap #27 Stage G (2026-10-04) - attempt count controls ONLY
+    /// retry cadence; wall-clock age alone controls terminal
+    /// classification. Stage F's bounded proof found the real remediation
+    /// sound but its original "4 attempts OR 24h" termination conflated
+    /// the two: with triggers firing as fast as device-unlock/foreground,
+    /// 4 attempts can exhaust in well under an hour - nowhere near proving
+    /// genuine route absence, when the only two real timing samples on
+    /// hand are a 27-minute natural case and a 45s forced-miss case. A
+    /// route must never go terminal merely because a handful of early,
+    /// closely-spaced queries came back empty.
+    ///
+    /// Early phase: the same 15s/1m/5m/30m floors as before, so the
+    /// common case (route finishes writing within a minute or two, user
+    /// still has the phone in hand) is unchanged. Once attemptCount
+    /// reaches `routeRetryEarlyBackoff.count`, the item moves into a slow
+    /// phase with a flat ~hourly floor - frequent opportunistic triggers
+    /// (foreground, unlock, observer) keep arriving but a trigger inside
+    /// that hour is simply not eligible, so it causes zero additional
+    /// HealthKit queries. This is the simplest rule that fits the
+    /// existing persisted queue unchanged: one more branch in the same
+    /// eligibility function, no new fields, no new storage.
+    internal static let routeRetryEarlyBackoff: [TimeInterval] = [15, 60, 300, 1800]
 
-    /// Attempts that actually queried HealthKit and found nothing. A skip
-    /// (protected data unavailable, or a resend that failed for network
-    /// reasons) must not count against this - see `handleRouteRetryLookupResult`.
-    internal static let routeRetryMaxAttempts = routeRetryBackoff.count
+    /// Flat eligibility floor once the early phase is exhausted - frequent
+    /// enough to still resolve well within the 24h window, coarse enough
+    /// that no realistic trigger frequency can turn it into HealthKit
+    /// hammering.
+    internal static let routeRetrySlowPhaseInterval: TimeInterval = 3600
 
-    /// Hard backstop independent of attemptCount, so a pending route that
-    /// never gets another sync opportunity (app never reopened) does not
-    /// stay pending forever.
+    /// The ONLY terminal criterion. Deliberately conservative and
+    /// provisional for production v1 - see this file's own header on
+    /// Stage F's two real timing samples being too few to tune this
+    /// further yet.
     internal static let routeRetryMaxAge: TimeInterval = 24 * 3600
 
     private func pendingRouteRetryFileURL() -> URL {
@@ -90,14 +105,30 @@ extension OpenWearablesHealthSDK {
         logMessage("Route pending retry recorded for workout \(workout.uuid.uuidString)")
     }
 
+    /// Attempt count picks the floor (early backoff step, or the flat slow-
+    /// phase interval once the early steps are exhausted) - it never
+    /// decides whether the item is still alive, only how soon it may be
+    /// checked again.
     internal func isRouteRetryEligibleNow(_ item: PendingRouteRetry, now: Date = Date()) -> Bool {
-        let step = min(item.attemptCount, Self.routeRetryBackoff.count - 1)
+        let floor: TimeInterval
+        if item.attemptCount < Self.routeRetryEarlyBackoff.count {
+            floor = Self.routeRetryEarlyBackoff[item.attemptCount]
+        } else {
+            floor = Self.routeRetrySlowPhaseInterval
+        }
         let base = item.lastAttemptAt ?? item.firstMissedAt
-        return now.timeIntervalSince(base) >= Self.routeRetryBackoff[step]
+        return now.timeIntervalSince(base) >= floor
     }
 
+    /// Wall-clock age since `firstMissedAt` is the ONLY terminal
+    /// criterion - attemptCount plays no part. A skipped check (protected
+    /// data unavailable, or a resend that failed for network reasons)
+    /// never advances `lastAttemptAt`/`attemptCount` (see
+    /// `handleRouteRetryLookupResult`), so it can only ever bring an item
+    /// closer to this age-based expiry by the passage of real time, the
+    /// same as a genuine miss would - never prematurely.
     internal func isRouteRetryExpired(_ item: PendingRouteRetry, now: Date = Date()) -> Bool {
-        item.attemptCount >= Self.routeRetryMaxAttempts || now.timeIntervalSince(item.firstMissedAt) >= Self.routeRetryMaxAge
+        now.timeIntervalSince(item.firstMissedAt) >= Self.routeRetryMaxAge
     }
 
     /// Opportunistic drain of the pending-route queue. A no-op when there

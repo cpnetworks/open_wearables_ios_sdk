@@ -138,27 +138,120 @@ final class RouteRetryTests: XCTestCase {
         }
     }
 
-    // MARK: - Persistent no-route eventually expires
+    // MARK: - Stage G: attempt count governs cadence only, never termination
 
-    func testExhaustedAttemptsAreDroppedWithoutEverResending() {
+    /// Four early misses - exactly the count that used to prune the entry
+    /// under Stage F's original policy - must now only advance it into
+    /// the slow phase, never remove it.
+    func testFourEarlyMissesDoNotPruneTheEntry() {
+        withIsolatedSDK { sdk, stateDirectory in
+            let workout = fakeWorkout()
+            sdk.routeRetryLookupOverrideForTests = { _, completion in completion(workout, nil) }
+
+            writePendingRetry(in: stateDirectory, uuid: workout.uuid, firstMissedAt: Date().addingTimeInterval(-20))
+            for _ in 0..<OpenWearablesHealthSDK.routeRetryEarlyBackoff.count {
+                sdk.retryPendingRoutesIfPossible()
+                XCTAssertTrue(waitUntil {
+                    let items = readPendingRetries(in: stateDirectory)
+                    return items.count == 1 && items[0].lastAttemptAt != nil
+                })
+                // Force the next attempt's floor to have already elapsed so
+                // the loop doesn't spend real wall-clock time waiting on
+                // the 30-minute early-phase step.
+                var items = readPendingRetries(in: stateDirectory)
+                items[0].lastAttemptAt = Date().addingTimeInterval(-3600)
+                try! JSONEncoder().encode(items).write(to: pendingRetryFileURL(in: stateDirectory))
+            }
+
+            let after = readPendingRetries(in: stateDirectory)
+            XCTAssertEqual(after.count, 1, "four early misses must not terminate the entry")
+            XCTAssertEqual(after[0].attemptCount, OpenWearablesHealthSDK.routeRetryEarlyBackoff.count)
+        }
+    }
+
+    func testAfterEarlyPhaseEligibilityUsesTheSlowInterval() {
         withIsolatedSDK { sdk, stateDirectory in
             sdk.routeRetryLookupOverrideForTests = { _, completion in
-                XCTFail("an already-exhausted item must be pruned before any HealthKit lookup")
+                XCTFail("must not query HealthKit before the slow-phase floor elapses")
                 completion(nil, nil)
             }
+            // Early phase exhausted (attemptCount == early backoff count),
+            // but only 10 minutes since the last attempt - well short of
+            // the ~hourly slow-phase floor.
             let item = writePendingRetry(
-                in: stateDirectory, firstMissedAt: Date().addingTimeInterval(-3600),
-                lastAttemptAt: Date().addingTimeInterval(-3600), attemptCount: OpenWearablesHealthSDK.routeRetryMaxAttempts
+                in: stateDirectory, firstMissedAt: Date().addingTimeInterval(-2 * 3600),
+                lastAttemptAt: Date().addingTimeInterval(-600), attemptCount: OpenWearablesHealthSDK.routeRetryEarlyBackoff.count
             )
 
             sdk.retryPendingRoutesIfPossible()
 
-            XCTAssertTrue(waitUntil { readPendingRetries(in: stateDirectory).isEmpty })
-            _ = item
+            XCTAssertEqual(readPendingRetries(in: stateDirectory), [item])
         }
     }
 
-    func testItemPastMaxAgeIsDroppedEvenWithAttemptsRemaining() {
+    /// Simulates several opportunistic triggers (foreground/unlock/observer)
+    /// landing inside the same slow-phase hour - each must be a complete
+    /// no-op, never touching HealthKit.
+    func testRepeatedTriggersWithinTheSlowIntervalCauseNoAdditionalHealthKitQueries() {
+        withIsolatedSDK { sdk, stateDirectory in
+            var queryCount = 0
+            sdk.routeRetryLookupOverrideForTests = { _, completion in
+                queryCount += 1
+                completion(nil, nil)
+            }
+            writePendingRetry(
+                in: stateDirectory, firstMissedAt: Date().addingTimeInterval(-2 * 3600),
+                lastAttemptAt: Date().addingTimeInterval(-600), attemptCount: OpenWearablesHealthSDK.routeRetryEarlyBackoff.count
+            )
+
+            for _ in 0..<5 { sdk.retryPendingRoutesIfPossible() }
+
+            XCTAssertEqual(queryCount, 0, "a trigger inside the slow-phase interval must not reach HealthKit at all")
+        }
+    }
+
+    func testRouteFoundDuringSlowPhaseSucceedsAndClearsTheEntry() {
+        withIsolatedSDK { sdk, stateDirectory in
+            let workout = fakeWorkout()
+            writePendingRetry(
+                in: stateDirectory, uuid: workout.uuid, firstMissedAt: Date().addingTimeInterval(-3 * 3600),
+                lastAttemptAt: Date().addingTimeInterval(-3700), attemptCount: OpenWearablesHealthSDK.routeRetryEarlyBackoff.count + 2
+            )
+            sdk.routeRetryLookupOverrideForTests = { [weak self] _, completion in
+                completion(workout, self?.fakeRoutePoints)
+            }
+            StubURLProtocol.install { _ in .status(202) }
+
+            sdk.retryPendingRoutesIfPossible()
+
+            XCTAssertTrue(waitUntil { StubURLProtocol.requests(matching: "/sync").count == 1 })
+            XCTAssertTrue(waitUntil { readPendingRetries(in: stateDirectory).isEmpty })
+        }
+    }
+
+    func testAgeUnderTwentyFourHoursNeverExpiresRegardlessOfAttemptCount() {
+        withIsolatedSDK { sdk, stateDirectory in
+            let workout = fakeWorkout()
+            // Route genuinely still missing (workout exists, no route) -
+            // not "workout deleted," which is the nil-workout case covered
+            // by testWorkoutNoLongerInHealthKitRemovesPendingEntryWithoutResend.
+            sdk.routeRetryLookupOverrideForTests = { _, completion in completion(workout, nil) }
+            // Many more misses than the old attempt-count limit ever allowed,
+            // but still well under 24h old - must survive.
+            let item = writePendingRetry(
+                in: stateDirectory, uuid: workout.uuid, firstMissedAt: Date().addingTimeInterval(-23 * 3600),
+                lastAttemptAt: Date().addingTimeInterval(-3700), attemptCount: 50
+            )
+
+            sdk.retryPendingRoutesIfPossible()
+
+            XCTAssertTrue(waitUntil { readPendingRetries(in: stateDirectory).count == 1 })
+            let after = readPendingRetries(in: stateDirectory).first
+            XCTAssertEqual(after?.workoutUUID, item.workoutUUID, "age alone governs termination - attempt count must not expire it")
+        }
+    }
+
+    func testAgeAtOrPastTwentyFourHoursPrunesTheEntry() {
         withIsolatedSDK { sdk, stateDirectory in
             sdk.routeRetryLookupOverrideForTests = { _, completion in
                 XCTFail("an item past max age must be pruned before any HealthKit lookup")
@@ -172,6 +265,28 @@ final class RouteRetryTests: XCTestCase {
             sdk.retryPendingRoutesIfPossible()
 
             XCTAssertTrue(waitUntil { readPendingRetries(in: stateDirectory).isEmpty })
+        }
+    }
+
+    /// Protected-data-unavailable right at the edge of the 24h window must
+    /// still be a pure skip - it must not be treated as a confirming miss
+    /// that would otherwise justify expiry, and it must not itself expire
+    /// the entry early.
+    func testProtectedDataUnavailableNearExpiryDoesNotCountAsAGenuineMiss() {
+        withIsolatedSDK { sdk, stateDirectory in
+            sdk.protectedDataAvailableOverrideForTests = false
+            sdk.routeRetryLookupOverrideForTests = { _, completion in
+                XCTFail("must not query HealthKit while protected data is unavailable")
+                completion(nil, nil)
+            }
+            let item = writePendingRetry(
+                in: stateDirectory, firstMissedAt: Date().addingTimeInterval(-23.9 * 3600),
+                lastAttemptAt: Date().addingTimeInterval(-3700), attemptCount: 10
+            )
+
+            sdk.retryPendingRoutesIfPossible()
+
+            XCTAssertEqual(readPendingRetries(in: stateDirectory), [item], "a skip near expiry must leave the entry exactly as it was")
         }
     }
 

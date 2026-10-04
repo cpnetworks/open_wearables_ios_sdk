@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.18.0
+
+* **Route retry terminal semantics corrected** (Map Roadmap #27 Stage G): a bounded real-device proof of Stage F's retry mechanism showed attempt count was being conflated with evidence of genuine route absence — with opportunistic triggers firing as often as device-unlock/foreground, the original "4 attempts" cap could exhaust in well under an hour, nowhere near the 24h window it was meant to bound. Attempt count now governs ONLY retry cadence (the same 15s/1m/5m/30m early floors, then a flat ~hourly floor once those are exhausted — frequent triggers inside that hour are a no-op, never reaching HealthKit); wall-clock age since the first miss is now the ONLY terminal criterion, unchanged at 24h. A protected-data-unavailable or network/auth-failure skip still never advances the attempt clock and never counts toward termination.
+
 ## 0.17.0
 
 * **Apple route availability race remediation** (Map Roadmap #27 Stage F): a `HKWorkoutRoute` is not always locally available the instant its parent `HKWorkout` is delivered via the anchored/observer sync — confirmed on a real device, a route was still missing 4.6s after the workout ended but fully present ~27 minutes later. A miss in `fetchRoutePayload` is no longer final: it is tracked in a small persisted, bounded retry queue (`pending_apple_route_retries.json`) and re-checked opportunistically (observer-driven sync, foreground, device unlock, `BGProcessingTask`) on a ~15s/1m/5m/30m backoff, capped at 4 attempts or 24h. The workout itself still syncs promptly either way — this never gates or delays it. A route found on retry is resent as an ordinary one-workout sync payload; the server's existing natural-key resolution attaches it to the same `EventRecord`, so no duplicate workout or route is ever created.
