@@ -530,14 +530,28 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// }
     /// ```
     public func requestAuthorization(types: [HealthDataType], completion: @escaping (Bool) -> Void) {
-        self.trackedTypes = mapTypes(types)
-        OpenWearablesHealthSdkKeychain.saveTrackedTypes(types.map { $0.rawValue })
-        
+        let effectiveTypes = Self.normalizedTypesForAuthorization(types)
+        self.trackedTypes = mapTypes(effectiveTypes)
+        OpenWearablesHealthSdkKeychain.saveTrackedTypes(effectiveTypes.map { $0.rawValue })
+
         logMessage("Requesting auth for \(trackedTypes.count) types")
-        
+
         requestAuthorizationInternal { ok in
             completion(ok)
         }
+    }
+
+    /// Ensures a route-only authorization request can never be constructed.
+    /// HealthKit requires HKObjectType.workoutType() to be named in the SAME
+    /// `read` set as HKSeriesType.workoutRoute() - requesting the route type
+    /// alone throws a real, uncaught NSInvalidArgumentException on the
+    /// calling thread (confirmed on-device; see RouteDiagnostics.swift in
+    /// the Sole Mates app for the incident this guards against - Round 1 of
+    /// that incident froze the app because of exactly this). Pure/static so
+    /// this specific guard is unit-testable without a real HKHealthStore.
+    internal static func normalizedTypesForAuthorization(_ types: [HealthDataType]) -> [HealthDataType] {
+        guard types.contains(.workoutRoute) && !types.contains(.workout) else { return types }
+        return types + [.workout]
     }
     
     /// Request HealthKit read authorization using raw string identifiers.
@@ -720,10 +734,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let disallowedIdentifiers: Set<String> = [
             HKCorrelationTypeIdentifier.bloodPressure.rawValue
         ]
-        
+
         return trackedTypes.filter { type in
             !disallowedIdentifiers.contains(type.identifier)
         }
+    }
+
+    /// Map Roadmap #27 - the generic per-type sync loop's own view of
+    /// trackedTypes, further excluding HKSeriesType.workoutRoute() on top
+    /// of whatever getQueryableTypes() already excludes. Route content is
+    /// deliberately NOT synced as its own top-level series the way every
+    /// other tracked type is (a generic HKSampleQuery/HKAnchoredObjectQuery
+    /// against it would not even return location data - that needs the
+    /// specialized HKWorkoutRouteQuery) - it stays attached to its own
+    /// workout's payload via fetchRoutePayloads(for:), called once per
+    /// sync round from the workout branch below, never queried generically
+    /// here. getQueryableTypes() itself is untouched and still includes
+    /// workoutRoute for the AUTHORIZATION read set (requestAuthorizationInternal) -
+    /// these are two different concerns with two different required answers.
+    internal func getSyncableTypes() -> [HKSampleType] {
+        let routeIdentifier = HKSeriesType.workoutRoute().identifier
+        return getQueryableTypes().filter { $0.identifier != routeIdentifier }
     }
 
     // MARK: - Internal: Sync
@@ -795,7 +826,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        let queryableTypes = getQueryableTypes()
+        // Map Roadmap #27 - getSyncableTypes(), not getQueryableTypes():
+        // HKSeriesType.workoutRoute() must be authorized (getQueryableTypes()
+        // still includes it there) but never queried generically here - see
+        // getSyncableTypes()'s own doc comment.
+        let queryableTypes = getSyncableTypes()
         guard !queryableTypes.isEmpty else {
             logMessage("No queryable types")
             finishSync(generation: generation)
@@ -1069,52 +1104,66 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 return
             }
             
-            let payload = self.buildCombinedPayload(samples: allSamples)
-            
-            self.uploadCombinedPayload(
-                payload: payload, endpoint: endpoint, credential: freshCredential,
-                generation: rrState.generation
-            ) { [weak self] sendSuccess in
+            // Map Roadmap #27 - fetch each workout's own route(s) BEFORE
+            // building the payload (buildCombinedPayload is synchronous;
+            // HealthKit's route query APIs are not). A no-op (completes
+            // immediately with an empty dictionary) when this round has no
+            // workouts at all - see fetchRoutePayloads's own doc comment.
+            let workoutsInRound = allSamples.compactMap { $0 as? HKWorkout }
+            self.fetchRoutePayloads(for: workoutsInRound) { [weak self] routesByWorkoutId in
                 guard let self = self else { completion(false); return }
-                if !sendSuccess { completion(false); return }
                 if self.isSyncCancelled(generation: rrState.generation) {
                     completion(false)
                     return
                 }
-                
-                // Phase 3: Update progress for all types that had data
-                for result in withData {
-                    if fullExport {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
-                        )
-                    } else {
-                        self.updateTypeProgress(
-                            typeIdentifier: result.type.identifier, sentInChunk: result.count,
-                            isComplete: result.isDone, anchorData: result.anchorData
-                        )
-                        if result.isDone {
-                            rrState.completedTypes.insert(result.type.identifier)
+
+                let payload = self.buildCombinedPayload(samples: allSamples, routesByWorkoutId: routesByWorkoutId)
+
+                self.uploadCombinedPayload(
+                    payload: payload, endpoint: endpoint, credential: freshCredential,
+                    generation: rrState.generation
+                ) { [weak self] sendSuccess in
+                    guard let self = self else { completion(false); return }
+                    if !sendSuccess { completion(false); return }
+                    if self.isSyncCancelled(generation: rrState.generation) {
+                        completion(false)
+                        return
+                    }
+
+                    // Phase 3: Update progress for all types that had data
+                    for result in withData {
+                        if fullExport {
+                            self.updateTypeProgress(
+                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                isComplete: false, anchorData: nil, olderThan: result.nextOlderThan
+                            )
+                        } else {
+                            self.updateTypeProgress(
+                                typeIdentifier: result.type.identifier, sentInChunk: result.count,
+                                isComplete: result.isDone, anchorData: result.anchorData
+                            )
+                            if result.isDone {
+                                rrState.completedTypes.insert(result.type.identifier)
+                            }
                         }
                     }
-                }
-                
-                // Phase 4: For full export, capture anchors for done types
-                let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
-                if fullExport && !fullExportDone.isEmpty {
-                    self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
-                        guard captureOk else { completion(false); return }
+
+                    // Phase 4: For full export, capture anchors for done types
+                    let fullExportDone = withData.filter { $0.isDone }.map { $0.type } + doneTypesForAnchorCapture.filter { t in !withData.contains(where: { $0.type == t }) }
+                    if fullExport && !fullExportDone.isEmpty {
+                        self.captureAnchorsForDoneTypes(types: fullExportDone, index: 0, rrState: rrState) { captureOk in
+                            guard captureOk else { completion(false); return }
+                            self.processNextRound(
+                                types: types, fullExport: fullExport, endpoint: endpoint,
+                                rrState: rrState, completion: completion
+                            )
+                        }
+                    } else {
                         self.processNextRound(
                             types: types, fullExport: fullExport, endpoint: endpoint,
                             rrState: rrState, completion: completion
                         )
                     }
-                } else {
-                    self.processNextRound(
-                        types: types, fullExport: fullExport, endpoint: endpoint,
-                        rrState: rrState, completion: completion
-                    )
                 }
             }
         }
@@ -1210,8 +1259,105 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
     
+    // MARK: - Route fetching (Map Roadmap #27 - Apple Route Ingestion Foundation)
+
+    /// Queries HKWorkoutRoute objects belonging to EACH workout
+    /// individually via HKQuery.predicateForObjects(from: workout) - never
+    /// a separate time/distance-based re-match across workouts - so a
+    /// route can never be attached to the wrong HKWorkout representation.
+    /// A workout with no route (indoor, or none recorded) simply yields no
+    /// entry in the result dictionary - this is the normal case, not an
+    /// error; this method does NOT distinguish "no route" from "query
+    /// failed" in its result (both produce no entry) since neither should
+    /// block the workout's own upload - see import_service.py's
+    /// NOT_PRESENT semantics for how the server treats a workout with no
+    /// route key at all.
+    ///
+    /// Runs BEFORE buildCombinedPayload (which is synchronous - HealthKit's
+    /// route query APIs are completion-handler based) rather than being
+    /// woven into that payload builder. This is a deliberate, bounded cost
+    /// per sync round for the smallest correct implementation, not a
+    /// performance optimization pass.
+    internal func fetchRoutePayloads(for workouts: [HKWorkout], completion: @escaping ([UUID: [[String: Any]]]) -> Void) {
+        guard !workouts.isEmpty else { completion([:]); return }
+
+        var result: [UUID: [[String: Any]]] = [:]
+        let group = DispatchGroup()
+
+        for workout in workouts {
+            group.enter()
+            fetchRoutePayload(for: workout) { payload in
+                if let payload, !payload.isEmpty {
+                    result[workout.uuid] = payload
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            completion(result)
+        }
+    }
+
+    /// One workout's route(s), already flattened + segment-tagged.
+    /// Multiple HKWorkoutRoute objects (segmented/paused-resumed
+    /// activities) are ordered by their own .startDate (HKWorkoutRoute
+    /// conforms to HKSample) via the query's own sortDescriptors - that
+    /// array position becomes segmentIndex. The final per-point `seq` is
+    /// still re-derived server-side (see apple_route.py's own doc comment)
+    /// so a client-side ordering bug can never silently corrupt the stored
+    /// sequence - this is just the one place that knows which
+    /// HKWorkoutRoute object came first.
+    private func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
+        let predicate = HKQuery.predicateForObjects(from: workout)
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+        let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samplesOrNil, error in
+            guard let self = self else { completion(nil); return }
+            guard let routes = samplesOrNil as? [HKWorkoutRoute], error == nil, !routes.isEmpty else {
+                completion(nil)
+                return
+            }
+            self.collectRoutePoints(routes: routes, routeIndex: 0, accumulated: [], completion: completion)
+        }
+        healthStore.execute(routeQuery)
+    }
+
+    private func collectRoutePoints(routes: [HKWorkoutRoute], routeIndex: Int, accumulated: [[String: Any]], completion: @escaping ([[String: Any]]?) -> Void) {
+        guard routeIndex < routes.count else {
+            completion(accumulated.isEmpty ? nil : accumulated)
+            return
+        }
+        var segmentPoints: [[String: Any]] = []
+        let formatter = ISO8601DateFormatter()
+        let locationQuery = HKWorkoutRouteQuery(route: routes[routeIndex]) { [weak self] _, locationsOrNil, done, _ in
+            guard let self = self else { return }
+            if let locations = locationsOrNil {
+                for loc in locations {
+                    var point: [String: Any] = [
+                        "t": formatter.string(from: loc.timestamp),
+                        "lat": loc.coordinate.latitude,
+                        "lng": loc.coordinate.longitude,
+                        "segmentIndex": routeIndex,
+                    ]
+                    // "where valid" (§3 of the WP) - CLLocation reports an
+                    // invalid reading as NaN (altitude) or a negative value
+                    // (accuracy), per Apple's own documented convention;
+                    // never fabricated as 0 when invalid, simply omitted.
+                    if loc.altitude.isFinite { point["alt"] = loc.altitude }
+                    if loc.horizontalAccuracy >= 0 { point["hAcc"] = loc.horizontalAccuracy }
+                    if loc.verticalAccuracy >= 0 { point["vAcc"] = loc.verticalAccuracy }
+                    segmentPoints.append(point)
+                }
+            }
+            if done {
+                self.collectRoutePoints(routes: routes, routeIndex: routeIndex + 1, accumulated: accumulated + segmentPoints, completion: completion)
+            }
+        }
+        healthStore.execute(locationQuery)
+    }
+
     // MARK: - Fetch-Only Chunk Processors (no network)
-    
+
     private func fetchOneChunkNewestFirst(
         type: HKSampleType, olderThan: Date?, chunkLimit: Int, generation: Int,
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ nextOlderThan: Date?, _ isDone: Bool) -> Void

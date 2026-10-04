@@ -81,6 +81,21 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     // Workout
     case workout
 
+    // Workout Route (Map Roadmap #27 - Apple Route Ingestion Foundation,
+    // 2026-10-04) - HKSeriesType.workoutRoute(), the GPS track attached to
+    // an outdoor HKWorkout. HealthKit REQUIRES HKObjectType.workoutType()
+    // to be named in the SAME `read` set whenever this type is requested -
+    // a route-only request throws a real, uncaught
+    // NSInvalidArgumentException (confirmed on-device; see
+    // normalizedTypesForAuthorization(_:), which enforces this pairing
+    // structurally so that invalid call can never be constructed). Also
+    // deliberately excluded from the generic per-type sync loop (see
+    // getSyncableTypes()) - route content requires the specialized
+    // HKWorkoutRouteQuery, not a generic HKSampleQuery/HKAnchoredObjectQuery,
+    // and must stay attached to its own workout's payload rather than
+    // becoming its own top-level synced series.
+    case workoutRoute
+
     // Workout Effort (iOS 18.0+ / watchOS 11.0+)
     case workoutEffortScore
     case estimatedWorkoutEffortScore
@@ -216,6 +231,11 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return nil
         case .workout:
             return HKObjectType.workoutType()
+        case .workoutRoute:
+            // HKSeriesType is itself a subclass of HKSampleType, so this
+            // fits the existing toHKSampleType() -> HKSampleType? contract
+            // unchanged.
+            return HKSeriesType.workoutRoute()
         case .workoutEffortScore:
             if #available(iOS 18.0, watchOS 11.0, *) {
                 return HKObjectType.quantityType(forIdentifier: .workoutEffortScore)
@@ -240,13 +260,21 @@ extension OpenWearablesHealthSDK {
     /// handed to `JSONSerialization` in one piece, so peak memory scales with the round.
     /// It is bounded by the round size instead - background rounds carry 100 records
     /// (~65 KB), and the 2000-record rounds only run in the foreground.
-    internal func buildCombinedPayload(samples: [HKSample]) -> [String: Any] {
+    ///
+    /// `routesByWorkoutId` (Map Roadmap #27) - pre-fetched route point
+    /// payloads keyed by the originating HKWorkout's own UUID, looked up
+    /// via fetchRoutePayloads(for:completion:) BEFORE this function runs
+    /// (route querying is async; this function is not) - see that
+    /// method's own doc comment for why the prefetch happens one level up
+    /// rather than here. Absent/empty for a workout with no route - never
+    /// fabricated.
+    internal func buildCombinedPayload(samples: [HKSample], routesByWorkoutId: [UUID: [[String: Any]]] = [:]) -> [String: Any] {
         var workouts: [[String: Any]] = []
         var records: [[String: Any]] = []
         var sleep: [[String: Any]] = []
-        
+
         let dateFormatter = ISO8601DateFormatter()
-        
+
         let batchSize = 100
         for batchStart in stride(from: 0, to: samples.count, by: batchSize) {
             autoreleasepool {
@@ -255,7 +283,7 @@ extension OpenWearablesHealthSDK {
                 
                 for s in batch {
                     if let w = s as? HKWorkout {
-                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter))
+                        workouts.append(_mapWorkoutEfficient(w, dateFormatter: dateFormatter, route: routesByWorkoutId[w.uuid]))
                     } else if let q = s as? HKQuantitySample {
                         records.append(_mapQuantityEfficient(q, dateFormatter: dateFormatter))
                     } else if let c = s as? HKCategorySample {
@@ -651,7 +679,7 @@ extension OpenWearablesHealthSDK {
         return records
     }
 
-    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter) -> [String: Any] {
+    private func _mapWorkoutEfficient(_ w: HKWorkout, dateFormatter: ISO8601DateFormatter, route: [[String: Any]]? = nil) -> [String: Any] {
         let stats = _buildWorkoutStats(w)
 
         return [
@@ -667,7 +695,11 @@ extension OpenWearablesHealthSDK {
             "values": stats,
             "segments": NSNull(),
             "laps": _buildWorkoutLaps(w, dateFormatter: dateFormatter),
-            "route": NSNull(),
+            // Map Roadmap #27 - populated only when fetchRoutePayloads(for:)
+            // found a non-empty HKWorkoutRoute for THIS exact workout (see
+            // buildCombinedPayload's routesByWorkoutId doc comment) - never
+            // fabricated, never re-matched from a different workout.
+            "route": route.map { $0 as Any } ?? NSNull(),
             "samples": NSNull(),
             "metadata": NSNull()
         ]
