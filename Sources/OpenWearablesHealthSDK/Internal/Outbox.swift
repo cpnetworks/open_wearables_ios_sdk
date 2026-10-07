@@ -62,7 +62,7 @@ extension OpenWearablesHealthSDK {
         // function has only ever had the one call site in this codebase,
         // but defaulting rather than making it required keeps this change
         // purely additive at the signature level too.
-        self.logMessage("TRACE_UPLOAD_START req=\(requestId) sampleCount=\(sampleCount)")
+        self.logDiagnostic("TRACE_UPLOAD_START req=\(requestId) sampleCount=\(sampleCount)")
 
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }

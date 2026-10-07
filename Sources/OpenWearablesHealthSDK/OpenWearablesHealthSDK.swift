@@ -26,6 +26,42 @@ internal enum TokenRefreshResult {
     case networkError
 }
 
+/// Sync Progress Tracing WP (2026-10-07) — what one sync round (one
+/// generation) actually ended with, for the host app's own UI to key its
+/// "completed" claim on. `completedGeneration` (see its own doc comment)
+/// only ever says a round TERMINATED — never why. This is the "why,"
+/// captured for the exact generation it describes.
+///
+/// `.success` deliberately means only "this round finished locally with
+/// nothing left pending" — it says nothing about whether Open Wearables
+/// has durably processed or will ever surface anything that was uploaded
+/// as part of it (a 2xx response means accepted for async processing, not
+/// processed — see this WP's own investigation doc). A host app must not
+/// read `.success` as "the server has this now."
+internal enum SyncRoundOutcome: String, Equatable {
+    /// The round reached its own natural end with no error — this
+    /// includes "there was nothing new to send," not only "something was
+    /// sent and accepted."
+    case success
+    /// Ran out of background execution time or hit some other bound that
+    /// stops this round short without an error — more work remains and a
+    /// later round will pick it up. Not a failure.
+    case incompleteWillResume
+    /// A HealthKit query itself reported an error for at least one type
+    /// (excluding the protected-data/device-locked pause, which is its
+    /// own separate, already-handled state).
+    case failedQuery
+    /// An upload attempt did not reach a 2xx outcome, and no refresh+retry
+    /// recovered it — includes transport errors, server errors, and a
+    /// 401 whose retry (after a successful refresh) still failed.
+    case failedUpload
+    /// A token refresh was itself rejected (or no refreshable credential
+    /// existed) during this round — reported separately from a generic
+    /// upload failure since it usually needs the app to re-authenticate,
+    /// not just retry later.
+    case failedAuth
+}
+
 /// Main entry point for the Open Wearables Health SDK.
 /// Use `OpenWearablesHealthSDK.shared` to access the singleton instance.
 ///
@@ -183,6 +219,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// read, because it is monotonic and sticky rather than a snapshot of
     /// "is something happening right now."
     private var completedGeneration: Int = 0
+    /// The outcome `completedGeneration` finished with — see
+    /// `SyncRoundOutcome`'s own doc comment. Updated in the same
+    /// lock-protected write as `completedGeneration` itself (finishSync),
+    /// so a reader never observes one without the other.
+    private var completedOutcome: SyncRoundOutcome = .success
     private var cancelRequestedAt: Date?
     
     /// How long a cancelled run may keep the sync slot before the next run takes it
@@ -850,18 +891,20 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         guard HKHealthStore.isHealthDataAvailable() else {
             logMessage("HealthKit not available")
-            finishSync(generation: generation)
+            // Can't even attempt a query — closest of the three failure
+            // categories, see SyncRoundOutcome's own doc comment.
+            finishSync(generation: generation, outcome: .failedQuery)
             completion()
             return
         }
-        
+
         guard self.authCredential != nil, let endpoint = self.syncEndpoint else {
             logMessage("No auth credential or endpoint")
-            finishSync(generation: generation)
+            finishSync(generation: generation, outcome: .failedAuth)
             completion()
             return
         }
-        
+
         // Map Roadmap #27 - getSyncableTypes(), not getQueryableTypes():
         // HKSeriesType.workoutRoute() must be authorized (getQueryableTypes()
         // still includes it there) but never queried generically here - see
@@ -869,7 +912,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let queryableTypes = getSyncableTypes()
         guard !queryableTypes.isEmpty else {
             logMessage("No queryable types")
-            finishSync(generation: generation)
+            // Not a failure — nothing is configured/authorized to sync,
+            // so there is trivially nothing new. See SyncRoundOutcome's
+            // own doc comment on why .success covers this case.
+            finishSync(generation: generation, outcome: .success)
             completion()
             return
         }
@@ -914,15 +960,33 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             if effectiveFullExport {
                 self.fullSyncStartTime = syncStartTime
             }
+
+            // Sync Progress Tracing WP (2026-10-07) — the only way to learn
+            // "a token refresh was itself rejected during this round"
+            // without changing uploadCombinedPayload's own completion
+            // signature (shared by call sites and tests outside this
+            // round-robin entirely): observe the SAME onAuthError callback
+            // the SDK already fires distinctly for that case
+            // (emitAuthError, from handle401ForUpload), scoped to exactly
+            // this round's lifetime, then restore whatever the host app
+            // had installed.
+            var hadAuthFailure = false
+            let previousAuthErrorHandler = self.onAuthError
+            self.onAuthError = { status, message in
+                hadAuthFailure = true
+                previousAuthErrorHandler?(status, message)
+            }
+
             self.processTypesRoundRobin(
                 types: queryableTypes,
                 fullExport: effectiveFullExport,
                 endpoint: endpoint,
                 isBackground: isBackground,
                 generation: generation
-            ) { [weak self] allTypesCompleted in
+            ) { [weak self] allTypesCompleted, hadQueryError, hadUploadFailure in
                 guard let self = self else { return }
-                
+                self.onAuthError = previousAuthErrorHandler
+
                 if effectiveFullExport && !allTypesCompleted {
                     let durationMs = Int(Date().timeIntervalSince(syncStartTime) * 1000)
                     let state = self.loadSyncState()
@@ -936,14 +1000,35 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         }
                     }
                 }
-                
+
                 if allTypesCompleted {
                     self.finalizeSyncState()
                 } else {
                     self.logMessage("Sync incomplete - will resume remaining types later")
                 }
                 self.fullSyncStartTime = nil
-                self.finishSync(generation: generation)
+
+                // Sync Progress Tracing WP (2026-10-07) — priority order
+                // matters: an auth failure or upload failure is reported
+                // as such even if it happened on the very last type (where
+                // other types might already show allTypesCompleted-ish
+                // progress) — a partial success is still the round's
+                // outcome if any part of it failed outright, distinct from
+                // incompleteWillResume (which never means a failure, only
+                // "ran out of time/budget").
+                let outcome: SyncRoundOutcome
+                if hadAuthFailure {
+                    outcome = .failedAuth
+                } else if hadUploadFailure {
+                    outcome = .failedUpload
+                } else if hadQueryError {
+                    outcome = .failedQuery
+                } else if allTypesCompleted {
+                    outcome = .success
+                } else {
+                    outcome = .incompleteWillResume
+                }
+                self.finishSync(generation: generation, outcome: outcome)
                 completion()
             }
         }
@@ -977,7 +1062,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let generation: Int
         /// Whether the caller already knows it runs in the background (BG tasks do).
         let declaredBackground: Bool
-        
+
+        /// Sync Progress Tracing WP (2026-10-07) — set at the exact point
+        /// each kind of failure is observed (see fetchOneChunkNewestFirst/
+        /// fetchOneChunkIncremental's real-error branch, and
+        /// processNextRound's upload-failure branch), read back once in
+        /// collectAllData's own completion to compute this round's
+        /// SyncRoundOutcome. Excludes the protected-data/device-locked
+        /// pause, which is its own separate, already-handled state, never
+        /// a failure.
+        var hadQueryError = false
+        var hadUploadFailure = false
+
         init(generation: Int, declaredBackground: Bool) {
             self.generation = generation
             self.declaredBackground = declaredBackground
@@ -1001,7 +1097,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         endpoint: URL,
         isBackground: Bool,
         generation: Int,
-        completion: @escaping (Bool) -> Void
+        // Sync Progress Tracing WP (2026-10-07) — (allTypesCompleted,
+        // hadQueryError, hadUploadFailure), read back from rrState once
+        // the round genuinely ends, so collectAllData's own completion
+        // can compute a SyncRoundOutcome instead of a bare Bool.
+        completion: @escaping (Bool, Bool, Bool) -> Void
     ) {
         let rrState = RoundRobinState(generation: generation, declaredBackground: isBackground)
         
@@ -1028,8 +1128,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         processNextRound(
             types: types, fullExport: fullExport, endpoint: endpoint,
-            rrState: rrState, completion: completion
-        )
+            rrState: rrState
+        ) { allTypesCompleted in
+            completion(allTypesCompleted, rrState.hadQueryError, rrState.hadUploadFailure)
+        }
     }
     
     // MARK: - Round result for accumulating fetched data
@@ -1104,7 +1206,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
 
             if allSamples.isEmpty {
-                self.logMessage("TRACE_ROUND_SKIP reason=no_samples_any_type fullExport=\(fullExport) typesInRound=\(results.count) doneThisRound=\(doneTypesForAnchorCapture.count)")
+                self.logDiagnostic("TRACE_ROUND_SKIP reason=no_samples_any_type fullExport=\(fullExport) typesInRound=\(results.count) doneThisRound=\(doneTypesForAnchorCapture.count)")
                 if fullExport && !doneTypesForAnchorCapture.isEmpty {
                     self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) { captureOk in
                         guard captureOk else { completion(false); return }
@@ -1161,8 +1263,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     generation: rrState.generation, sampleCount: allSamples.count
                 ) { [weak self] sendSuccess in
                     guard let self = self else { completion(false); return }
-                    self.logMessage("TRACE_ROUND_UPLOAD_RESULT sendSuccess=\(sendSuccess) typesWithData=\(withData.count)")
-                    if !sendSuccess { completion(false); return }
+                    self.logDiagnostic("TRACE_ROUND_UPLOAD_RESULT sendSuccess=\(sendSuccess) typesWithData=\(withData.count)")
+                    if !sendSuccess {
+                        rrState.hadUploadFailure = true
+                        completion(false)
+                        return
+                    }
                     if self.isSyncCancelled(generation: rrState.generation) {
                         completion(false)
                         return
@@ -1224,7 +1330,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         if fullExport {
             let cursor = rrState.olderThanCursors[type.identifier]
-            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation) {
+            fetchOneChunkNewestFirst(type: type, olderThan: cursor, chunkLimit: chunkLimit, generation: rrState.generation, rrState: rrState) {
                 [weak self] success, samples, nextOlderThan, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
@@ -1241,7 +1347,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
         } else {
             let anchor = rrState.anchorCursors[type.identifier]
-            fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit, generation: rrState.generation) {
+            fetchOneChunkIncremental(type: type, anchor: anchor, chunkLimit: chunkLimit, generation: rrState.generation, rrState: rrState) {
                 [weak self] success, samples, newAnchor, anchorData, isDone in
                 guard let self = self else { completion(false, accumulated); return }
                 if !success { completion(false, accumulated); return }
@@ -1442,11 +1548,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let df = ISO8601DateFormatter()
         let earliestEnd = samples.map { $0.endDate }.min().map { df.string(from: $0) } ?? "none"
         let latestEnd = samples.map { $0.endDate }.max().map { df.string(from: $0) } ?? "none"
-        logMessage("TRACE_QUERY type=\(shortTypeName(type.identifier)) scope=\(scope) sampleCount=\(samples.count) earliestEnd=\(earliestEnd) latestEnd=\(latestEnd) error=\(error ?? "none")")
+        logDiagnostic("TRACE_QUERY type=\(shortTypeName(type.identifier)) scope=\(scope) sampleCount=\(samples.count) earliestEnd=\(earliestEnd) latestEnd=\(latestEnd) error=\(error ?? "none")")
     }
 
     private func fetchOneChunkNewestFirst(
-        type: HKSampleType, olderThan: Date?, chunkLimit: Int, generation: Int,
+        type: HKSampleType, olderThan: Date?, chunkLimit: Int, generation: Int, rrState: RoundRobinState,
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ nextOlderThan: Date?, _ isDone: Bool) -> Void
     ) {
         if isSyncCancelled(generation: generation) { completion(false, [], nil, false); return }
@@ -1477,6 +1583,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
                     self.traceQueryRound(type: type, scope: "historical", samples: [], error: error.localizedDescription)
+                    rrState.hadQueryError = true
                     completion(true, [], nil, true)
                     return
                 }
@@ -1501,7 +1608,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     private func fetchOneChunkIncremental(
-        type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int, generation: Int,
+        type: HKSampleType, anchor: HKQueryAnchor?, chunkLimit: Int, generation: Int, rrState: RoundRobinState,
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
     ) {
         if isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
@@ -1527,6 +1634,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
                     self.traceQueryRound(type: type, scope: "incremental", samples: [], error: error.localizedDescription)
+                    rrState.hadQueryError = true
                     completion(true, [], nil, nil, true)
                     return
                 }
@@ -1643,7 +1751,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     /// Releases the sync slot. A run that has already lost the slot to a newer one
     /// must not clear it, otherwise it would let a third run start on top of a live one.
-    internal func finishSync(generation: Int) {
+    ///
+    /// `outcome` defaults to `.success` so every pre-existing call site
+    /// (and every test that calls this directly) keeps compiling and
+    /// behaving exactly as before without being migrated — callers that
+    /// know the round failed or is only partially done pass the real
+    /// outcome explicitly (see `collectAllData`'s own call site).
+    internal func finishSync(generation: Int, outcome: SyncRoundOutcome = .success) {
         syncLock.lock()
         defer { syncLock.unlock() }
         guard generation == syncGeneration else { return }
@@ -1651,6 +1765,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         isInitialSyncInProgress = false
         cancelRequestedAt = nil
         completedGeneration = generation
+        completedOutcome = outcome
     }
 
     /// The generation most recently claimed by `beginSyncRun()` — read this
@@ -1672,6 +1787,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncLock.lock()
         defer { syncLock.unlock() }
         return completedGeneration
+    }
+
+    /// What `lastCompletedSyncGeneration` actually finished with — read
+    /// both together (this one second) so a caller who cares about outcome
+    /// never pairs a stale outcome with a newer generation number.
+    internal var lastSyncOutcome: SyncRoundOutcome {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return completedOutcome
     }
     
     /// Returns the remaining background execution time when the app is in the

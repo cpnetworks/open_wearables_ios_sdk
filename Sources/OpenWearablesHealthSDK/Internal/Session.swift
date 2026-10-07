@@ -85,7 +85,7 @@ extension OpenWearablesHealthSDK {
         // this explicitly, since the question "did progress/anchors
         // actually advance for this chunk" has no other direct signal.
         guard var state = loadSyncState() else {
-            logMessage("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=false reason=no_sync_state_to_update")
+            logDiagnostic("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=false reason=no_sync_state_to_update")
             return
         }
 
@@ -119,7 +119,7 @@ extension OpenWearablesHealthSDK {
         }
 
         saveSyncState(state)
-        logMessage("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=true sentInChunk=\(sentInChunk) totalSent=\(state.totalSentCount) isComplete=\(isComplete) anchorSaved=\(anchorSaved)")
+        logDiagnostic("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=true sentInChunk=\(sentInChunk) totalSent=\(state.totalSentCount) isComplete=\(isComplete) anchorSaved=\(anchorSaved)")
     }
     
     internal func updateCurrentTypeIndex(_ index: Int) {
@@ -230,6 +230,12 @@ extension OpenWearablesHealthSDK {
         // already the one dict-based status surface callers poll.
         let generation = currentSyncGeneration
         let completedGeneration = lastCompletedSyncGeneration
+        // Sync Progress Tracing WP (2026-10-07) — what completedGeneration
+        // actually finished with; see SyncRoundOutcome's own doc comment.
+        // A host app must read this alongside completedGeneration, never
+        // completedGeneration alone, to decide whether a round actually
+        // succeeded rather than merely terminated.
+        let lastOutcome = lastSyncOutcome.rawValue
 
         if let state = loadSyncState() {
             return [
@@ -241,6 +247,7 @@ extension OpenWearablesHealthSDK {
                 "isSyncing": isSyncingVisible,
                 "generation": generation,
                 "completedGeneration": completedGeneration,
+                "lastOutcome": lastOutcome,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -253,6 +260,7 @@ extension OpenWearablesHealthSDK {
                 "isSyncing": isSyncingVisible,
                 "generation": generation,
                 "completedGeneration": completedGeneration,
+                "lastOutcome": lastOutcome,
                 "createdAt": NSNull()
             ]
         }
