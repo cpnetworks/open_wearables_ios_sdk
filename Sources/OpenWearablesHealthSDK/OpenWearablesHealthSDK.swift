@@ -2003,7 +2003,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         guard let refreshToken = self.refreshToken, let url = self.tokenRefreshEndpoint else {
             tokenRefreshLock.unlock()
-            logMessage("Token refresh failed: no credentials or refresh URL")
+            // Sync Progress Tracing WP (2026-10-07) — same bug class as
+            // logUploadOutcome's success branch and this WP's own TRACE_
+            // lines: every exit of this function that leads to .authFailure
+            // or .networkError used logMessage, silenced by the same
+            // default logLevel in Release. A caller (handle401ForUpload)
+            // separately surfaces .authFailure via the unconditional
+            // onAuthError callback, but .networkError has no such backup —
+            // without this, a refresh that fails for a network reason
+            // (as opposed to being rejected) was invisible end to end.
+            logDiagnostic("Token refresh failed: no credentials or refresh URL")
             completion(.authFailure)
             return
         }
@@ -2016,7 +2025,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         let body: [String: String] = ["refresh_token": refreshToken]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
-            logMessage("Token refresh failed: serialization error")
+            logDiagnostic("Token refresh failed: serialization error")
             finishTokenRefresh(result: .networkError)
             return
         }
@@ -2026,30 +2035,30 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             guard let self = self else { return }
             
             if let error = error {
-                self.logMessage("Token refresh failed: \(error.localizedDescription)")
+                self.logDiagnostic("Token refresh failed: \(error.localizedDescription)")
                 self.finishTokenRefresh(result: .networkError)
                 return
             }
-            
+
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            
+
             if (401...403).contains(statusCode) {
-                self.logMessage("Token refresh rejected: HTTP \(statusCode)")
+                self.logDiagnostic("Token refresh rejected: HTTP \(statusCode)")
                 self.finishTokenRefresh(result: .authFailure)
                 return
             }
-            
+
             guard let httpResponse = response as? HTTPURLResponse,
                   (200...299).contains(httpResponse.statusCode),
                   let data = data else {
-                self.logMessage("Token refresh failed: HTTP \(statusCode)")
+                self.logDiagnostic("Token refresh failed: HTTP \(statusCode)")
                 self.finishTokenRefresh(result: .networkError)
                 return
             }
-            
+
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let newAccessToken = json["access_token"] as? String else {
-                self.logMessage("Token refresh failed: invalid response body")
+                self.logDiagnostic("Token refresh failed: invalid response body")
                 self.finishTokenRefresh(result: .networkError)
                 return
             }
