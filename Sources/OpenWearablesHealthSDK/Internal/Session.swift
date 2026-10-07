@@ -224,6 +224,13 @@ extension OpenWearablesHealthSDK {
         // or in progress; apps can use this to show a "keep the app open" hint.
         let initialExportDone = defaults.bool(forKey: fullDoneKey())
         
+        // Sync Progress Tracing WP (2026-10-07) — see currentSyncGeneration/
+        // lastCompletedSyncGeneration's own doc comments. Exposed here
+        // rather than as new public properties since getSyncStatus() is
+        // already the one dict-based status surface callers poll.
+        let generation = currentSyncGeneration
+        let completedGeneration = lastCompletedSyncGeneration
+
         if let state = loadSyncState() {
             return [
                 "hasResumableSession": state.hasProgress,
@@ -232,6 +239,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "generation": generation,
+                "completedGeneration": completedGeneration,
                 "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
             ]
         } else {
@@ -242,6 +251,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncingVisible,
+                "generation": generation,
+                "completedGeneration": completedGeneration,
                 "createdAt": NSNull()
             ]
         }

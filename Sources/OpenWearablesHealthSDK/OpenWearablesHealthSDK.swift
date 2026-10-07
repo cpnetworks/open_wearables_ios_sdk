@@ -171,6 +171,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var syncGeneration: Int = 0
     /// Every generation up to and including this one has been cancelled.
     private var cancelledGeneration: Int = 0
+    /// Sync Progress Tracing WP (2026-10-07) — every generation up to and
+    /// including this one has run to its own natural end (finishSync), on
+    /// EVERY exit path (success, failure, or a trivial no-op bail-out before
+    /// any network call) — see finishSync's own call sites. A caller that
+    /// captures `syncGeneration` right after starting a round and then polls
+    /// for `completedGeneration >= thatValue` gets a completion signal that
+    /// cannot be missed between polls, unlike the transient `isSyncing`
+    /// boolean: a round fast enough to start and finish between two poll
+    /// ticks still leaves this counter visibly advanced on the very next
+    /// read, because it is monotonic and sticky rather than a snapshot of
+    /// "is something happening right now."
+    private var completedGeneration: Int = 0
     private var cancelRequestedAt: Date?
     
     /// How long a cancelled run may keep the sync slot before the next run takes it
@@ -1638,6 +1650,28 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         isSyncing = false
         isInitialSyncInProgress = false
         cancelRequestedAt = nil
+        completedGeneration = generation
+    }
+
+    /// The generation most recently claimed by `beginSyncRun()` — read this
+    /// right after a round is confirmed started (e.g. right after
+    /// `startBackgroundSync`'s own completion fires with `started: true`).
+    /// `beginSyncRun()` runs synchronously inside that call, strictly before
+    /// its completion fires, so this value is already correct by then — see
+    /// `completedGeneration`'s own doc comment for why comparing against it
+    /// is immune to a round finishing faster than any poll interval.
+    internal var currentSyncGeneration: Int {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return syncGeneration
+    }
+
+    /// Every generation up to and including this one has already run to its
+    /// own natural end. See `completedGeneration`'s own doc comment.
+    internal var lastCompletedSyncGeneration: Int {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return completedGeneration
     }
     
     /// Returns the remaining background execution time when the app is in the
