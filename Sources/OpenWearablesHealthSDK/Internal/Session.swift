@@ -224,18 +224,18 @@ extension OpenWearablesHealthSDK {
         // or in progress; apps can use this to show a "keep the app open" hint.
         let initialExportDone = defaults.bool(forKey: fullDoneKey())
         
-        // Sync Progress Tracing WP (2026-10-07) — see currentSyncGeneration/
-        // lastCompletedSyncGeneration's own doc comments. Exposed here
-        // rather than as new public properties since getSyncStatus() is
-        // already the one dict-based status surface callers poll.
-        let generation = currentSyncGeneration
-        let completedGeneration = lastCompletedSyncGeneration
-        // Sync Progress Tracing WP (2026-10-07) — what completedGeneration
-        // actually finished with; see SyncRoundOutcome's own doc comment.
-        // A host app must read this alongside completedGeneration, never
-        // completedGeneration alone, to decide whether a round actually
-        // succeeded rather than merely terminated.
-        let lastOutcome = lastSyncOutcome.rawValue
+        // Sync Progress Tracing WP (2026-10-07) — one atomic read of all
+        // three (syncProgressSnapshot's own doc comment explains why this
+        // must not be three separate lock-scoped property reads): a host
+        // app comparing `generation` against `completedGeneration` to
+        // decide "is this attempt done," then reading `lastOutcome` to
+        // decide "did it succeed," needs all three to describe the exact
+        // same instant, not whatever finishSync had most recently written
+        // at the time of each individual read.
+        let snapshot = syncProgressSnapshot()
+        let generation = snapshot.generation
+        let completedGeneration = snapshot.completedGeneration
+        let lastOutcome = snapshot.outcome.rawValue
 
         if let state = loadSyncState() {
             return [

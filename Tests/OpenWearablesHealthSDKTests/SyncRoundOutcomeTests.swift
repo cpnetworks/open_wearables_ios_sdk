@@ -80,6 +80,31 @@ final class SyncRoundOutcomeTests: XCTestCase {
         }
     }
 
+    // MARK: - generation/completedGeneration/lastOutcome are one atomic snapshot, not three separate reads
+
+    /// `getSyncStatusDict()` used to read `currentSyncGeneration`,
+    /// `lastCompletedSyncGeneration` and `lastSyncOutcome` as three
+    /// separately lock-scoped property accesses. Confirms the dict a
+    /// caller actually polls always pairs the SAME completedGeneration
+    /// with the SAME outcome, for several different outcomes in sequence
+    /// — the real regression this guards is a `finishSync` for a newer
+    /// generation landing between two of those reads, which a single
+    /// `getSyncStatus()` call cannot observe by construction now.
+    func testGenerationAndOutcomeArePairedConsistentlyAcrossMultipleRounds() {
+        withIsolatedSDK { sdk, _ in
+            let outcomes: [SyncRoundOutcome] = [.success, .failedQuery, .incompleteWillResume, .failedUpload, .failedAuth]
+            for outcome in outcomes {
+                guard let generation = sdk.beginSyncRun() else { return XCTFail("could not start") }
+                sdk.finishSync(generation: generation, outcome: outcome)
+
+                let status = sdk.getSyncStatus()
+                XCTAssertEqual(status["completedGeneration"] as? Int, generation, "for outcome \(outcome)")
+                XCTAssertEqual(status["lastOutcome"] as? String, outcome.rawValue, "for outcome \(outcome)")
+                XCTAssertEqual(status["generation"] as? Int, generation, "for outcome \(outcome)")
+            }
+        }
+    }
+
     // MARK: - A real guard path: no auth credential sets .failedAuth through collectAllData itself
 
     func testNoCredentialGuardReportsFailedAuthThroughRealCollectAllData() {

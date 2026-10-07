@@ -1797,6 +1797,24 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         defer { syncLock.unlock() }
         return completedOutcome
     }
+
+    /// Sync Progress Tracing WP (2026-10-07) — `currentSyncGeneration`,
+    /// `lastCompletedSyncGeneration` and `lastSyncOutcome` above are each
+    /// correct in isolation, but reading them as three separate calls is
+    /// NOT atomic as a set: each locks and unlocks independently, so a
+    /// `finishSync` for a NEWER generation could run between any two of
+    /// those three reads, in principle pairing an older generation number
+    /// with a newer outcome (or vice versa). `getSyncStatusDict()` must
+    /// never do that — a caller comparing `generation` against
+    /// `completedGeneration` to decide "is this attempt done," then
+    /// reading `lastOutcome` to decide "did it succeed," needs all three
+    /// to describe the exact same instant. This takes the lock once for
+    /// all three.
+    internal func syncProgressSnapshot() -> (generation: Int, completedGeneration: Int, outcome: SyncRoundOutcome) {
+        syncLock.lock()
+        defer { syncLock.unlock() }
+        return (syncGeneration, completedGeneration, completedOutcome)
+    }
     
     /// Returns the remaining background execution time when the app is in the
     /// background, or `nil` when it is active (foreground has no time limit).
