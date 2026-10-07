@@ -79,8 +79,16 @@ extension OpenWearablesHealthSDK {
     }
     
     internal func updateTypeProgress(typeIdentifier: String, sentInChunk: Int, isComplete: Bool, anchorData: Data?, olderThan: Date? = nil) {
-        guard var state = loadSyncState() else { return }
-        
+        // Sync Progress Tracing WP (2026-10-07) — this guard silently drops
+        // progress with no log line at all if a SyncState file doesn't
+        // exist at this moment (e.g. already finalized/cleared). Tracing
+        // this explicitly, since the question "did progress/anchors
+        // actually advance for this chunk" has no other direct signal.
+        guard var state = loadSyncState() else {
+            logMessage("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=false reason=no_sync_state_to_update")
+            return
+        }
+
         var progress = state.typeProgress[typeIdentifier] ?? TypeSyncProgress(
             typeIdentifier: typeIdentifier,
             sentCount: 0,
@@ -88,7 +96,7 @@ extension OpenWearablesHealthSDK {
             pendingAnchorData: nil,
             pendingOlderThan: nil
         )
-        
+
         progress.sentCount += sentInChunk
         progress.isComplete = isComplete
         if let anchorData = anchorData {
@@ -97,18 +105,21 @@ extension OpenWearablesHealthSDK {
         if let olderThan = olderThan {
             progress.pendingOlderThan = olderThan
         }
-        
+
         state.typeProgress[typeIdentifier] = progress
         state.totalSentCount += sentInChunk
-        
+
+        var anchorSaved = false
         if isComplete {
             state.completedTypes.insert(typeIdentifier)
             if let anchorData = progress.pendingAnchorData {
                 saveAnchorData(anchorData, typeIdentifier: typeIdentifier, userKey: state.userKey)
+                anchorSaved = true
             }
         }
-        
+
         saveSyncState(state)
+        logMessage("TRACE_PROGRESS type=\(shortTypeName(typeIdentifier)) advanced=true sentInChunk=\(sentInChunk) totalSent=\(state.totalSentCount) isComplete=\(isComplete) anchorSaved=\(anchorSaved)")
     }
     
     internal func updateCurrentTypeIndex(_ index: Int) {

@@ -41,6 +41,7 @@ extension OpenWearablesHealthSDK {
         endpoint: URL,
         credential: String,
         generation: Int,
+        sampleCount: Int = -1,
         completion: @escaping (Bool) -> Void
     ) {
         guard let payloadData = try? JSONSerialization.data(withJSONObject: payload) else {
@@ -48,16 +49,24 @@ extension OpenWearablesHealthSDK {
             completion(false)
             return
         }
-        
+
         let requestId = UUID().uuidString
         var req = buildRequest(url: endpoint, credential: credential, requestId: requestId)
         req.httpBody = payloadData
-        
+
         self.logPayloadSummary(payloadData, label: "Sending")
-        
+        // Sync Progress Tracing WP (2026-10-07) — correlates this exact
+        // upload attempt (by requestId, same one logUploadOutcome below
+        // uses) with how many samples it actually carries. sampleCount
+        // defaults to -1 ("not supplied") for any other caller — this
+        // function has only ever had the one call site in this codebase,
+        // but defaulting rather than making it required keeps this change
+        // purely additive at the signature level too.
+        self.logMessage("TRACE_UPLOAD_START req=\(requestId) sampleCount=\(sampleCount)")
+
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
-            
+
             let completedTask = self.untrackSyncUpload(requestId: requestId)
             let statusCode = (response as? HTTPURLResponse)?.statusCode
             self.logUploadOutcome(

@@ -1090,8 +1090,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let allSamples = withData.flatMap { $0.samples }
             
             let doneTypesForAnchorCapture = results.filter { $0.isDone }.map { $0.type }
-            
+
             if allSamples.isEmpty {
+                self.logMessage("TRACE_ROUND_SKIP reason=no_samples_any_type fullExport=\(fullExport) typesInRound=\(results.count) doneThisRound=\(doneTypesForAnchorCapture.count)")
                 if fullExport && !doneTypesForAnchorCapture.isEmpty {
                     self.captureAnchorsForDoneTypes(types: doneTypesForAnchorCapture, index: 0, rrState: rrState) { captureOk in
                         guard captureOk else { completion(false); return }
@@ -1145,9 +1146,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
                 self.uploadCombinedPayload(
                     payload: payload, endpoint: endpoint, credential: freshCredential,
-                    generation: rrState.generation
+                    generation: rrState.generation, sampleCount: allSamples.count
                 ) { [weak self] sendSuccess in
                     guard let self = self else { completion(false); return }
+                    self.logMessage("TRACE_ROUND_UPLOAD_RESULT sendSuccess=\(sendSuccess) typesWithData=\(withData.count)")
                     if !sendSuccess { completion(false); return }
                     if self.isSyncCancelled(generation: rrState.generation) {
                         completion(false)
@@ -1414,6 +1416,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
     // MARK: - Fetch-Only Chunk Processors (no network)
 
+    /// Sync Progress Tracing WP (2026-10-07) — distinguishes "the HealthKit
+    /// query found nothing new," "the query errored," and "the query found
+    /// N samples" from each other, purely additive alongside the existing
+    /// logMessage calls below (never replaces one, never changes what any
+    /// caller does with a result). Timestamps only — no sample UUIDs, no
+    /// HealthKit payload content, no tokens. See this WP's own
+    /// investigation doc for why: the app's own screen-level "watch_completed"
+    /// signal was confirmed to fire on a stale persisted flag regardless of
+    /// whether a round like this one ever ran or found anything, so that
+    /// signal alone cannot answer what happened at the query boundary.
+    private func traceQueryRound(type: HKSampleType, scope: String, samples: [HKSample], error: String?) {
+        let df = ISO8601DateFormatter()
+        let earliestEnd = samples.map { $0.endDate }.min().map { df.string(from: $0) } ?? "none"
+        let latestEnd = samples.map { $0.endDate }.max().map { df.string(from: $0) } ?? "none"
+        logMessage("TRACE_QUERY type=\(shortTypeName(type.identifier)) scope=\(scope) sampleCount=\(samples.count) earliestEnd=\(earliestEnd) latestEnd=\(latestEnd) error=\(error ?? "none")")
+    }
+
     private func fetchOneChunkNewestFirst(
         type: HKSampleType, olderThan: Date?, chunkLimit: Int, generation: Int,
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ nextOlderThan: Date?, _ isDone: Bool) -> Void
@@ -1445,20 +1464,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         return
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
+                    self.traceQueryRound(type: type, scope: "historical", samples: [], error: error.localizedDescription)
                     completion(true, [], nil, true)
                     return
                 }
-                
+
                 let samples = samplesOrNil ?? []
                 if samples.isEmpty {
                     self.logMessage("  \(self.shortTypeName(type.identifier)): all data sent (newest first)")
+                    self.traceQueryRound(type: type, scope: "historical", samples: [], error: nil)
                     completion(true, [], nil, true)
                     return
                 }
-                
+
                 let isLastChunk = samples.count < chunkLimit
                 let nextOlderThan = isLastChunk ? nil : samples.last!.endDate
                 self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples (newest first)")
+                self.traceQueryRound(type: type, scope: "historical", samples: samples, error: nil)
                 completion(true, samples, nextOlderThan, isLastChunk)
             }
         }
@@ -1492,29 +1514,32 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         return
                     }
                     self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
+                    self.traceQueryRound(type: type, scope: "incremental", samples: [], error: error.localizedDescription)
                     completion(true, [], nil, nil, true)
                     return
                 }
-                
+
                 let samples = samplesOrNil ?? []
                 let deletedCount = deletedObjects?.count ?? 0
-                
+
                 var anchorData: Data? = nil
                 if let newAnchor = newAnchor {
                     anchorData = try? NSKeyedArchiver.archivedData(withRootObject: newAnchor, requiringSecureCoding: true)
                 }
-                
+
                 if samples.isEmpty && deletedCount == 0 {
                     self.logMessage("  \(self.shortTypeName(type.identifier)): complete")
+                    self.traceQueryRound(type: type, scope: "incremental", samples: [], error: nil)
                     completion(true, [], newAnchor, anchorData, true)
                     return
                 }
-                
+
                 // Deleted objects count against the query limit. Ignoring them made a
                 // chunk with samples + deletions look like the last one, so the anchor
                 // for the remaining (unfetched) data was never advanced.
                 let isLastChunk = (samples.count + deletedCount) < chunkLimit
                 self.logMessage("  \(self.shortTypeName(type.identifier)): \(samples.count) samples" + (deletedCount > 0 ? ", \(deletedCount) deleted" : ""))
+                self.traceQueryRound(type: type, scope: "incremental", samples: samples, error: nil)
                 completion(true, samples, newAnchor, anchorData, isLastChunk)
             }
         }
