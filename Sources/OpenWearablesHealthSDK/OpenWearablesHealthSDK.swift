@@ -1953,22 +1953,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             fields.append("status=\(statusCode)")
         }
         
-        var isFailure = statusCode.map { !(200...299).contains($0) } ?? true
-        
         if let error = error as NSError? {
-            isFailure = true
             fields.append("error=\(error.domain)(\(error.code))")
             if error.code == NSURLErrorCancelled {
                 fields.append("cancelledBy=\(cancellationAttribution())")
             }
         }
         
-        let message = fields.joined(separator: " ")
-        if isFailure {
-            logDiagnostic(message)
-        } else {
-            logMessage(message)
-        }
+        // Sync Progress Tracing WP (2026-10-07) — found while verifying
+        // Release-build logging end to end: this only used logDiagnostic
+        // (survives Release) for the isFailure branch; a genuinely
+        // successful upload's own confirmation line used logMessage,
+        // silenced by the same default-logLevel gate as this WP's own
+        // TRACE_ lines. Same bug class, same fix — "the records needed to
+        // explain a failed sync after the fact" (this function's own
+        // original doc comment, above) applies just as much to confirming
+        // a success as to explaining a failure.
+        logDiagnostic(fields.joined(separator: " "))
     }
     
     // MARK: - Token Refresh
