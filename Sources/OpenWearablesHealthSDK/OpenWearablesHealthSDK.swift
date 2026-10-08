@@ -311,7 +311,18 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// leaves both nil.
     internal var historicalRescanEnumerationOverrideForTests:
         ((Date?, Date?, Int, @escaping (Bool, [HKWorkout], Date?, Bool) -> Void) -> Void)?
-    internal var historicalRescanRouteLookupOverrideForTests: ((HKWorkout, @escaping ([[String: Any]]?) -> Void) -> Void)?
+
+    /// Sole Mates WP #30 (2026-10-08) hardening - overrides
+    /// `fetchRoutePayloadOutcome`, the one real HealthKit-touching
+    /// boundary both the live-sync path (via `fetchRoutePayload`'s thin
+    /// wrapper, unchanged) and HistoricalRouteRescan now share. Placed
+    /// BELOW that boundary (not at `routePayload`/`fetchRoutePayload`
+    /// itself, as the historical-rescan-specific seam used to be) so a
+    /// test exercises the REAL outcome-interpretation logic in
+    /// HistoricalRouteRescan.processHistoricalRescanWorkouts - only the
+    /// raw HealthKit call is faked, never the decision about what to do
+    /// with its result. Production leaves this nil.
+    internal var routePayloadOutcomeOverrideForTests: ((HKWorkout, @escaping (RouteFetchOutcome) -> Void) -> Void)?
 
     #if DEBUG
     /// Map Roadmap #27 Stage F bounded real-device proof ONLY - see
@@ -1452,20 +1463,56 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
     }
 
-    /// One workout's route(s), already flattened + segment-tagged.
-    /// Multiple HKWorkoutRoute objects (segmented/paused-resumed
-    /// activities) are ordered by their own .startDate (HKWorkoutRoute
-    /// conforms to HKSample) via the query's own sortDescriptors - that
-    /// array position becomes segmentIndex. The final per-point `seq` is
-    /// still re-derived server-side (see apple_route.py's own doc comment)
-    /// so a client-side ordering bug can never silently corrupt the stored
-    /// sequence - this is just the one place that knows which
-    /// HKWorkoutRoute object came first.
+    /// Sole Mates WP #30 (2026-10-08) hardening. The THREE outcomes a
+    /// route query can genuinely produce, kept structurally distinct so
+    /// no caller can conflate them:
+    ///   - `.found`: real route points.
+    ///   - `.noRouteObjectsPresent`: the query itself succeeded (no
+    ///     error) and found zero `HKWorkoutRoute` objects. For a workout
+    ///     from moments ago this is exactly Stage F's known timing lag,
+    ///     NOT authoritative; for a workout from weeks/months ago (the
+    ///     historical-rescan case) there is no plausible "still
+    ///     arriving" window left, so the SAME outcome means something
+    ///     different depending on the CALLER's own age context - this
+    ///     type only reports what HealthKit actually said, the caller
+    ///     decides what it means.
+    ///   - `.queryFailed`: HealthKit returned a real error - a fundamentally
+    ///     different situation from "zero objects, no error" and must never
+    ///     be folded into it. `isAuthorizationDenied` is set when the error
+    ///     is identifiably `HKError.errorAuthorizationDenied`; HealthKit's
+    ///     read-authorization model otherwise makes "permission vs. no
+    ///     data" genuinely indistinguishable by design (Apple does not let
+    ///     an app learn whether read access to a type was denied), so this
+    ///     is the one reliable signal available, not a complete permission
+    ///     check - see HistoricalRouteRescan.swift's own use of this flag
+    ///     for why that distinction still matters operationally.
+    internal enum RouteFetchOutcome {
+        case found([[String: Any]])
+        case noRouteObjectsPresent
+        case queryFailed(isAuthorizationDenied: Bool)
+    }
+
+    /// One workout's route(s), already flattened + segment-tagged - the
+    /// one real HealthKit-touching function; `fetchRoutePayload` below is
+    /// a thin, behavior-preserving wrapper every pre-existing caller
+    /// keeps using unchanged. Multiple HKWorkoutRoute objects (segmented/
+    /// paused-resumed activities) are ordered by their own .startDate
+    /// (HKWorkoutRoute conforms to HKSample) via the query's own
+    /// sortDescriptors - that array position becomes segmentIndex. The
+    /// final per-point `seq` is still re-derived server-side (see
+    /// apple_route.py's own doc comment) so a client-side ordering bug
+    /// can never silently corrupt the stored sequence - this is just the
+    /// one place that knows which HKWorkoutRoute object came first.
     /// `internal`, not `private` - Stage F's pending-route retry
-    /// (RouteRetry.swift) calls this same query for its own re-check, so a
-    /// delayed route is found via the IDENTICAL query shape that eventually
-    /// finds it, never a second, divergent implementation.
-    internal func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
+    /// (RouteRetry.swift, via fetchRoutePayload) calls this same query
+    /// for its own re-check, so a delayed route is found via the
+    /// IDENTICAL query shape that eventually finds it, never a second,
+    /// divergent implementation.
+    internal func fetchRoutePayloadOutcome(for workout: HKWorkout, completion: @escaping (RouteFetchOutcome) -> Void) {
+        if let override = routePayloadOutcomeOverrideForTests {
+            override(workout, completion)
+            return
+        }
         #if DEBUG
         // Map Roadmap #27 Stage F bounded proof ONLY - see
         // armForcedRouteFetchMiss's own doc comment. Wrapped in #if DEBUG
@@ -1478,33 +1525,52 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if let armedAfter = forcedRouteMissAfterForDebugProof, workout.startDate >= armedAfter {
             forcedRouteMissAfterForDebugProof = nil
             logMessage("DEBUG: forcing route fetch miss for workout \(workout.uuid.uuidString) (Stage F proof)")
-            recordPendingRouteRetryIfNeeded(for: workout)
-            completion(nil)
+            completion(.noRouteObjectsPresent)
             return
         }
         #endif
         let predicate = HKQuery.predicateForObjects(from: workout)
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
         let routeQuery = HKSampleQuery(sampleType: HKSeriesType.workoutRoute(), predicate: predicate, limit: HKObjectQueryNoLimit, sortDescriptors: [sort]) { [weak self] _, samplesOrNil, error in
-            guard let self = self else { completion(nil); return }
-            guard let routes = samplesOrNil as? [HKWorkoutRoute], error == nil, !routes.isEmpty else {
-                // Map Roadmap #27 Stage F - a miss here is NOT authoritative
-                // evidence of "no route": HKWorkoutRoute can lag the parent
-                // HKWorkout's own availability by more than this query's
-                // own timing margin (empirically observed >4.6s, <27min on
-                // a real Apple Watch recording). Track it for a bounded,
-                // independent retry rather than treating this as the final
-                // answer - the workout itself still syncs normally this
-                // round regardless (see fetchRoutePayloads's own doc
-                // comment: this method never blocks the workout's own
-                // upload on route availability).
-                self.recordPendingRouteRetryIfNeeded(for: workout)
-                completion(nil)
+            guard let self = self else { completion(.queryFailed(isAuthorizationDenied: false)); return }
+            if let error = error {
+                let isAuthDenied = (error as? HKError)?.code == .errorAuthorizationDenied
+                completion(.queryFailed(isAuthorizationDenied: isAuthDenied))
                 return
             }
-            self.collectRoutePoints(routes: routes, routeIndex: 0, accumulated: [], completion: completion)
+            guard let routes = samplesOrNil as? [HKWorkoutRoute], !routes.isEmpty else {
+                completion(.noRouteObjectsPresent)
+                return
+            }
+            self.collectRoutePoints(routes: routes, routeIndex: 0, accumulated: []) { points in
+                completion(points.map { .found($0) } ?? .noRouteObjectsPresent)
+            }
         }
         healthStore.execute(routeQuery)
+    }
+
+    /// Backward-compatible wrapper around `fetchRoutePayloadOutcome` -
+    /// every pre-existing caller (`fetchRoutePayloads` for ordinary sync,
+    /// RouteRetry.swift's own re-check) keeps its exact prior behavior:
+    /// a miss OF ANY KIND (no route objects, or the query itself failing)
+    /// still records a Stage F pending retry and completes with nil -
+    /// correct for THESE callers because every workout they ever see is
+    /// fresh (just synced, or already in the short-lived retry queue),
+    /// where "maybe still arriving" is always the right read regardless
+    /// of which HealthKit outcome produced the miss. HistoricalRouteRescan
+    /// (months-old workouts, no such live-arrival window) deliberately
+    /// calls `fetchRoutePayloadOutcome` directly instead of this wrapper -
+    /// see that file's own use of the outcome type for why.
+    internal func fetchRoutePayload(for workout: HKWorkout, completion: @escaping ([[String: Any]]?) -> Void) {
+        fetchRoutePayloadOutcome(for: workout) { [weak self] outcome in
+            switch outcome {
+            case .found(let points):
+                completion(points)
+            case .noRouteObjectsPresent, .queryFailed:
+                self?.recordPendingRouteRetryIfNeeded(for: workout)
+                completion(nil)
+            }
+        }
     }
 
     private func collectRoutePoints(routes: [HKWorkoutRoute], routeIndex: Int, accumulated: [[String: Any]], completion: @escaping ([[String: Any]]?) -> Void) {
