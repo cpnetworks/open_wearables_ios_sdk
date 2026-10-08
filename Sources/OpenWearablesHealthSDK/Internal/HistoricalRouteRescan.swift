@@ -54,6 +54,16 @@ import HealthKit
 /// installation already uploaded is safe (idempotent, natural-key
 /// resolved); resending one it never uploaded would be an unauthorized
 /// expansion of what this installation imports, not a route recovery.
+///
+/// WP #30 targeted-rescan hardening (2026-10-09) - `startHistoricalRouteRescan`'s
+/// optional `targetWindow` parameter can narrow this further, to an
+/// explicit sub-range a caller already knows contains unresolved
+/// workouts (so a small, targeted pilot invocation isn't spent
+/// re-examining already-resolved recent history first) - but can only
+/// ever narrow, never widen: the scope boundary above is unconditional
+/// and structurally enforced regardless of what any caller passes. See
+/// `HistoricalRescanTargetWindow` and `startHistoricalRouteRescan`'s own
+/// doc comment for the full mechanism.
 extension OpenWearablesHealthSDK {
 
     // MARK: - Progress model
@@ -103,6 +113,32 @@ extension OpenWearablesHealthSDK {
         case failedEnumerationQuery
     }
 
+    /// WP #30 targeted-rescan hardening (2026-10-09) - an explicit,
+    /// caller-supplied sub-range within the device's existing
+    /// `syncStartDate()` window. Exists so a pilot can target a small,
+    /// specific, already-known slice of history (e.g. a handful of
+    /// workouts confirmed missing a route) instead of always scanning
+    /// newest-first from today, which can spend an entire invocation's
+    /// `maxWorkouts` budget on already-resolved recent workouts before
+    /// ever reaching an older, genuinely unresolved one - see
+    /// `startHistoricalRouteRescan`'s own doc comment for the full
+    /// mechanism and the structural guarantee that this can never widen
+    /// the scan past the existing 30-day-style ceiling.
+    ///
+    /// `start`/`end` are validated by `startHistoricalRouteRescan`
+    /// itself (`end` must be strictly after `start`) - this struct is a
+    /// plain value type with no validation of its own, so constructing
+    /// an invalid one is always possible but is always rejected, safely
+    /// and visibly, at the one call site that matters.
+    public struct HistoricalRescanTargetWindow: Codable, Equatable {
+        public let start: Date
+        public let end: Date
+        public init(start: Date, end: Date) {
+            self.start = start
+            self.end = end
+        }
+    }
+
     public struct HistoricalRescanProgress: Codable, Equatable {
         public internal(set) var status: HistoricalRescanStatus
         /// nil until the first chunk completes; thereafter the oldest
@@ -125,11 +161,26 @@ extension OpenWearablesHealthSDK {
         /// never queued into the live-sync Stage F retry path (whose 24h
         /// window has no bearing on a months-old workout).
         public internal(set) var queryFailedCount: Int
+        /// WP #30 targeted-rescan hardening (2026-10-09) - the window
+        /// THIS run actually locked in, the first time it genuinely
+        /// began (see `startHistoricalRouteRescan`'s own doc comment for
+        /// exactly when that is). `nil` means "no window - the full
+        /// `syncStartDate()` range," which is also a real, deliberately
+        /// recorded decision, not an absence of one. Once a run has
+        /// begun, every later call to `startHistoricalRouteRescan` - a
+        /// resume after pause/cancel/stoppedAtWorkoutLimit/
+        /// failedAuthorization/failedEnumerationQuery - reuses THIS
+        /// value and ignores whatever `targetWindow` argument that call
+        /// is given, even a different one or none at all. This is what
+        /// makes "a resumed scan cannot escape its original target
+        /// window" a stored fact, not a convention the caller has to
+        /// uphold on its own.
+        public internal(set) var targetWindow: HistoricalRescanTargetWindow?
 
         static let notStartedValue = HistoricalRescanProgress(
             status: .notStarted, olderThanCursor: nil, scannedCount: 0,
             routeFoundCount: 0, resentCount: 0, resendFailedCount: 0,
-            noRouteConfirmedCount: 0, queryFailedCount: 0
+            noRouteConfirmedCount: 0, queryFailedCount: 0, targetWindow: nil
         )
     }
 
@@ -195,8 +246,43 @@ extension OpenWearablesHealthSDK {
     ///     run cleanly (`.stoppedAtWorkoutLimit`, resumable exactly like
     ///     a pause) rather than continuing until the whole window is
     ///     exhausted.
+    ///
+    /// WP #30 targeted-rescan hardening (2026-10-09) - `targetWindow`
+    /// (optional, default `nil`) narrows the scan to an explicit
+    /// sub-range. Omitting it is byte-for-byte the prior behavior - the
+    /// scan covers the whole `syncStartDate()` window exactly as before.
+    /// When supplied:
+    ///   - `targetWindow.end` must be strictly after `targetWindow.start`
+    ///     - an invalid (empty or inverted) window is refused outright,
+    ///     exactly like an invalid `maxWorkouts`: nothing changes, the
+    ///     current progress is returned unmodified, and the scan is
+    ///     NOT silently widened to the full window as a fallback.
+    ///   - The effective lower bound is `max(targetWindow.start,
+    ///     syncStartDate())` - a `targetWindow.start` earlier than the
+    ///     device's own 30-day-style ceiling can never push the floor
+    ///     earlier than that ceiling already allows. The
+    ///     `.refusedUnboundedWindow` guard above still runs first and is
+    ///     completely unaffected - a target window can never be used to
+    ///     bypass it.
+    ///   - **Once a run has genuinely begun** (progress.status is
+    ///     anything other than `.notStarted` or `.refusedUnboundedWindow`
+    ///     - i.e. at least one chunk has actually been attempted), the
+    ///     window it locked in at that moment (`progress.targetWindow`,
+    ///     possibly `nil` meaning "no window") is what every later call
+    ///     uses - resuming after `.paused`/`.cancelled`/
+    ///     `.stoppedAtWorkoutLimit`/`.failedAuthorization`/
+    ///     `.failedEnumerationQuery` ALWAYS reuses that stored window and
+    ///     ignores whatever `targetWindow` THIS call is given, even a
+    ///     different one or none at all. A resumed scan cannot escape
+    ///     its original target window - see
+    ///     `testResumedScanReusesItsOriginalTargetWindowEvenWhenGivenADifferentOrNoWindow`.
+    ///     `.notStarted` and `.refusedUnboundedWindow` are the only two
+    ///     states where no run has actually begun yet, so the caller's
+    ///     current argument is accepted and becomes the newly locked-in
+    ///     window.
     public func startHistoricalRouteRescan(
         maxWorkouts: Int = defaultMaxWorkoutsPerHistoricalRescanInvocation,
+        targetWindow: HistoricalRescanTargetWindow? = nil,
         completion: @escaping (HistoricalRescanProgress) -> Void
     ) {
         var progress = historicalRouteRescanProgress()
@@ -209,7 +295,15 @@ extension OpenWearablesHealthSDK {
             completion(progress)
             return
         }
-        guard let lowerBound = syncStartDate() else {
+        if let targetWindow, targetWindow.end <= targetWindow.start {
+            // WP #30 targeted-rescan hardening - fail safely, never
+            // silently fall back to scanning the full window. Progress
+            // is returned completely unmodified.
+            logMessage("Historical route rescan cannot start: targetWindow.end must be after targetWindow.start.")
+            completion(progress)
+            return
+        }
+        guard let lowerBoundFromSyncWindow = syncStartDate() else {
             logMessage("Historical route rescan refused: no finite syncDaysBack configured on this installation - refusing an unbounded historical scan.")
             progress.status = .refusedUnboundedWindow
             saveHistoricalRescanProgress(progress)
@@ -226,10 +320,27 @@ extension OpenWearablesHealthSDK {
             completion(progress)
             return
         }
+
+        // WP #30 targeted-rescan hardening - a run that has already
+        // begun locks in whatever window (including none) it started
+        // with; only a genuinely fresh decision point accepts THIS
+        // call's argument. See this function's own doc comment above.
+        let runAlreadyBegan = progress.status != .notStarted && progress.status != .refusedUnboundedWindow
+        let effectiveWindow = runAlreadyBegan ? progress.targetWindow : targetWindow
+
+        let lowerBound = effectiveWindow.map { Swift.max($0.start, lowerBoundFromSyncWindow) } ?? lowerBoundFromSyncWindow
+        // The window's upper edge only ever matters for the very first
+        // query of a run that has no cursor yet - every later chunk
+        // (same run or a resume) already has a cursor that can never
+        // exceed it, since the cursor only ever derives from a
+        // previously-bounded query's own oldest result.
+        let initialOlderThan = progress.olderThanCursor ?? effectiveWindow?.end
+
         progress.status = .running
+        progress.targetWindow = effectiveWindow
         saveHistoricalRescanProgress(progress)
         runHistoricalRescanChunk(
-            olderThan: progress.olderThanCursor, lowerBound: lowerBound, maxWorkouts: maxWorkouts,
+            olderThan: initialOlderThan, lowerBound: lowerBound, maxWorkouts: maxWorkouts,
             endpoint: endpoint, credential: credential, generation: generation, completion: completion
         )
     }

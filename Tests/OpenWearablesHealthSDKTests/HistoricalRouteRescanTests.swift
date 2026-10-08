@@ -228,6 +228,272 @@ final class HistoricalRouteRescanTests: XCTestCase {
         }
     }
 
+    // MARK: - Target window (WP #30 targeted-rescan hardening, 2026-10-09)
+
+    private let oneDay: TimeInterval = 86_400
+
+    func testTargetWindowOmittedPreservesExactPriorBehavior() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(14)
+            let expectedLowerBound = sdk.syncStartDate()
+            var capturedOlderThan: Date? = Date()  // sentinel, overwritten below
+            var capturedLowerBound: Date?? = .some(Date())
+            sdk.historicalRescanEnumerationOverrideForTests = { olderThan, lowerBound, _, completion in
+                capturedOlderThan = olderThan
+                capturedLowerBound = lowerBound
+                completion(true, [], nil, true)
+            }
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan { _ in expectation.fulfill() }
+            wait(for: [expectation], timeout: 2)
+
+            XCTAssertNil(capturedOlderThan, "no targetWindow means no upper bound, exactly as before this change")
+            XCTAssertEqual(capturedLowerBound, expectedLowerBound, "no targetWindow means the full syncStartDate() window, exactly as before this change")
+        }
+    }
+
+    func testTargetWindowRestrictsEnumerationToTheExplicitSubRange() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(30)
+            let ceiling = sdk.syncStartDate()!
+            // Comfortably inside the 30-day ceiling, so the window's own
+            // bounds - not the ceiling - are what should be observed.
+            let windowStart = ceiling.addingTimeInterval(10 * oneDay)
+            let windowEnd = ceiling.addingTimeInterval(20 * oneDay)
+
+            var capturedOlderThan: Date?? = .some(Date())
+            var capturedLowerBound: Date?? = .some(Date())
+            sdk.historicalRescanEnumerationOverrideForTests = { olderThan, lowerBound, _, completion in
+                capturedOlderThan = olderThan
+                capturedLowerBound = lowerBound
+                completion(true, [], nil, true)
+            }
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan(targetWindow: .init(start: windowStart, end: windowEnd)) { _ in expectation.fulfill() }
+            wait(for: [expectation], timeout: 2)
+
+            XCTAssertEqual(capturedLowerBound, windowStart, "the window's own start, not the full 30-day ceiling, must be the effective lower bound")
+            XCTAssertEqual(capturedOlderThan, windowEnd, "the window's own end must bound the first query's upper edge")
+        }
+    }
+
+    func testTargetWindowLowerBoundNeverEarlierThanThe30DayCeiling() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(5)
+            let ceiling = sdk.syncStartDate()!
+            // The window's own start is BEFORE the 5-day ceiling - a
+            // misconfigured or malicious caller trying to reach further
+            // back than the device's own syncDaysBack allows.
+            let earlierThanCeiling = ceiling.addingTimeInterval(-25 * oneDay)
+            let windowEnd = ceiling.addingTimeInterval(1 * oneDay)
+
+            var capturedLowerBound: Date?? = .some(Date())
+            sdk.historicalRescanEnumerationOverrideForTests = { _, lowerBound, _, completion in
+                capturedLowerBound = lowerBound
+                completion(true, [], nil, true)
+            }
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan(targetWindow: .init(start: earlierThanCeiling, end: windowEnd)) { _ in expectation.fulfill() }
+            wait(for: [expectation], timeout: 2)
+
+            XCTAssertEqual(capturedLowerBound, ceiling, "the effective lower bound must be clamped to the 30-day-style ceiling, never honoring a window.start earlier than it")
+        }
+    }
+
+    func testTargetWindowRefusesInvalidOrdering() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(14)
+            sdk.historicalRescanEnumerationOverrideForTests = { _, _, _, completion in
+                XCTFail("must not touch HealthKit at all with an invalid (empty/inverted) target window")
+                completion(false, [], nil, false)
+            }
+            let same = Date()
+            let expectation = expectation(description: "completion called")
+            // end == start is empty; end < start is inverted - both invalid.
+            sdk.startHistoricalRouteRescan(targetWindow: .init(start: same, end: same)) { progress in
+                XCTAssertEqual(progress.status, .notStarted, "must refuse cleanly, never silently fall back to the full window")
+                expectation.fulfill()
+            }
+            wait(for: [expectation], timeout: 2)
+            XCTAssertNil(sdk.historicalRouteRescanProgress().targetWindow, "an invalid window must never be persisted")
+        }
+    }
+
+    func testTargetWindowSmallerThanOneChunkCompletesWithoutScanningPastIt() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(30)
+            let ceiling = sdk.syncStartDate()!
+            let windowStart = ceiling.addingTimeInterval(10 * oneDay)
+            let windowEnd = ceiling.addingTimeInterval(11 * oneDay)
+            // Exactly the pilot's own real shape: a handful of known
+            // workouts, well under both the chunk limit (20) and
+            // maxWorkouts (25).
+            let workouts = (0..<4).map { fakeWorkout(start: windowStart.addingTimeInterval(Double($0) * 60)) }
+
+            sdk.historicalRescanEnumerationOverrideForTests = { _, _, _, completion in
+                completion(true, workouts, nil, true) // the window is exhausted - isDone per HealthKit's own signal
+            }
+            sdk.routePayloadOutcomeOverrideForTests = { _, completion in completion(.noRouteObjectsPresent) }
+
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan(maxWorkouts: 25, targetWindow: .init(start: windowStart, end: windowEnd)) { progress in
+                XCTAssertEqual(progress.status, .completed, "a window exhausted well under budget must complete, not report a workout-limit stop")
+                XCTAssertEqual(progress.scannedCount, 4, "exactly the known workouts in the window, not padded out toward the 25 cap")
+                expectation.fulfill()
+            }
+            wait(for: [expectation], timeout: 2)
+        }
+    }
+
+    func testTargetWindowProcessesAllWorkoutsInOneChunkInTheGivenOrder() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(30)
+            let ceiling = sdk.syncStartDate()!
+            let windowStart = ceiling.addingTimeInterval(10 * oneDay)
+            let windowEnd = ceiling.addingTimeInterval(11 * oneDay)
+            let workouts = (0..<3).map { fakeWorkout(start: windowStart.addingTimeInterval(Double($0) * 60)) }
+
+            sdk.historicalRescanEnumerationOverrideForTests = { _, _, _, completion in
+                completion(true, workouts, nil, true)
+            }
+            var processedOrder: [Date] = []
+            sdk.routePayloadOutcomeOverrideForTests = { workout, completion in
+                processedOrder.append(workout.startDate)
+                completion(.noRouteObjectsPresent)
+            }
+
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan(targetWindow: .init(start: windowStart, end: windowEnd)) { progress in
+                XCTAssertEqual(progress.scannedCount, 3, "every workout in the window's single chunk must be processed")
+                expectation.fulfill()
+            }
+            wait(for: [expectation], timeout: 2)
+
+            XCTAssertEqual(processedOrder, workouts.map(\.startDate), "must process them in exactly the order HealthKit returned them, unmodified by narrowing the window")
+        }
+    }
+
+    func testTargetWindowCancellationPreservesCursorWithinTheWindow() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(30)
+            let ceiling = sdk.syncStartDate()!
+            let windowStart = ceiling.addingTimeInterval(10 * oneDay)
+            let windowEnd = ceiling.addingTimeInterval(11 * oneDay)
+            let workout = fakeWorkout(start: windowStart.addingTimeInterval(60))
+
+            sdk.historicalRescanEnumerationOverrideForTests = { olderThan, _, _, completion in
+                if olderThan == windowEnd {
+                    completion(true, [workout], workout.endDate, false)
+                } else {
+                    XCTFail("must not start a second chunk after cancellation")
+                    completion(true, [], nil, true)
+                }
+            }
+            sdk.routePayloadOutcomeOverrideForTests = { _, completion in
+                sdk.cancelHistoricalRouteRescan()
+                completion(.noRouteObjectsPresent)
+            }
+
+            let expectation = expectation(description: "completion called")
+            sdk.startHistoricalRouteRescan(targetWindow: .init(start: windowStart, end: windowEnd)) { progress in
+                XCTAssertEqual(progress.status, .cancelled)
+                XCTAssertEqual(progress.olderThanCursor, workout.endDate, "cursor must still advance correctly to exactly what was processed, same as without a window")
+                XCTAssertEqual(progress.targetWindow, .init(start: windowStart, end: windowEnd), "the window itself must still be the one persisted")
+                expectation.fulfill()
+            }
+            wait(for: [expectation], timeout: 2)
+        }
+    }
+
+    /// WP #30 targeted-rescan hardening (2026-10-09) - the specific,
+    /// required regression test: once a run has genuinely begun, no
+    /// LATER call can widen or move its window, whether that call
+    /// supplies a completely different window or omits the argument
+    /// entirely. Exercises both sub-cases in one run, matching exactly
+    /// what was asked for.
+    func testResumedScanReusesItsOriginalTargetWindowEvenWhenGivenADifferentOrNoWindow() {
+        withIsolatedSDK { sdk, _ in
+            OpenWearablesHealthSdkKeychain.saveSyncDaysBack(30)
+            let ceiling = sdk.syncStartDate()!
+            let originalWindow = OpenWearablesHealthSDK.HistoricalRescanTargetWindow(
+                start: ceiling.addingTimeInterval(10 * oneDay),
+                end: ceiling.addingTimeInterval(11 * oneDay)
+            )
+            let decoyWindow = OpenWearablesHealthSDK.HistoricalRescanTargetWindow(
+                start: ceiling.addingTimeInterval(20 * oneDay),
+                end: ceiling.addingTimeInterval(21 * oneDay)
+            )
+            let firstWorkout = fakeWorkout(start: originalWindow.start.addingTimeInterval(60))
+
+            // Run 1: starts fresh with the ORIGINAL window, pauses after
+            // one workout (a non-final chunk, so a second chunk would
+            // follow if not paused).
+            sdk.historicalRescanEnumerationOverrideForTests = { olderThan, lowerBound, _, completion in
+                XCTAssertEqual(olderThan, originalWindow.end)
+                XCTAssertEqual(lowerBound, originalWindow.start)
+                completion(true, [firstWorkout], firstWorkout.endDate, false)
+            }
+            sdk.routePayloadOutcomeOverrideForTests = { _, completion in
+                sdk.pauseHistoricalRouteRescan()
+                completion(.noRouteObjectsPresent)
+            }
+            let firstRun = expectation(description: "first run paused with the original window")
+            sdk.startHistoricalRouteRescan(targetWindow: originalWindow) { progress in
+                XCTAssertEqual(progress.status, .paused)
+                firstRun.fulfill()
+            }
+            wait(for: [firstRun], timeout: 2)
+            XCTAssertEqual(sdk.historicalRouteRescanProgress().targetWindow, originalWindow)
+
+            // Run 2 (resume): supplies a COMPLETELY DIFFERENT window.
+            // The decoy window must be entirely ignored - the lower
+            // bound captured below must still be the ORIGINAL window's
+            // start, never the decoy's.
+            var secondRunCapturedLowerBound: Date?
+            sdk.historicalRescanEnumerationOverrideForTests = { olderThan, lowerBound, _, completion in
+                secondRunCapturedLowerBound = lowerBound
+                XCTAssertEqual(olderThan, firstWorkout.endDate, "resume must use the persisted cursor, not either window's end")
+                completion(true, [], nil, true)
+            }
+            let secondRun = expectation(description: "resumed with a different window argument")
+            sdk.startHistoricalRouteRescan(targetWindow: decoyWindow) { progress in
+                XCTAssertEqual(progress.status, .completed)
+                secondRun.fulfill()
+            }
+            wait(for: [secondRun], timeout: 2)
+            XCTAssertEqual(secondRunCapturedLowerBound, originalWindow.start, "a different window argument on resume must be completely ignored")
+            XCTAssertEqual(sdk.historicalRouteRescanProgress().targetWindow, originalWindow, "the persisted window must remain the original one, not the decoy")
+
+            // Run 3: reset and redo runs 1-2, but this time the resume
+            // call OMITS targetWindow entirely (nil) rather than
+            // supplying a decoy - must behave identically: the original
+            // window still wins.
+            sdk.resetHistoricalRouteRescan()
+            sdk.historicalRescanEnumerationOverrideForTests = { _, _, _, completion in
+                completion(true, [firstWorkout], firstWorkout.endDate, false)
+            }
+            let thirdRunStart = expectation(description: "third run paused with the original window")
+            sdk.startHistoricalRouteRescan(targetWindow: originalWindow) { progress in
+                XCTAssertEqual(progress.status, .paused)
+                thirdRunStart.fulfill()
+            }
+            wait(for: [thirdRunStart], timeout: 2)
+
+            var thirdRunCapturedLowerBound: Date?
+            sdk.historicalRescanEnumerationOverrideForTests = { _, lowerBound, _, completion in
+                thirdRunCapturedLowerBound = lowerBound
+                completion(true, [], nil, true)
+            }
+            let thirdRunResume = expectation(description: "resumed with NO window argument")
+            sdk.startHistoricalRouteRescan(targetWindow: nil) { progress in
+                XCTAssertEqual(progress.status, .completed)
+                thirdRunResume.fulfill()
+            }
+            wait(for: [thirdRunResume], timeout: 2)
+            XCTAssertEqual(thirdRunCapturedLowerBound, originalWindow.start, "omitting targetWindow on resume must NOT widen the scan back to the full syncStartDate() window")
+        }
+    }
+
     // MARK: - Route found -> resend
 
     func testRouteFoundResendsThroughTheNormalSyncPayloadShape() {
