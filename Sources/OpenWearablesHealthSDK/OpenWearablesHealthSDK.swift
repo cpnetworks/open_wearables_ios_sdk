@@ -304,6 +304,15 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal var protectedDataAvailableOverrideForTests: Bool?
     internal var routeRetryLookupOverrideForTests: ((UUID, @escaping (HKWorkout?, [[String: Any]]?) -> Void) -> Void)?
 
+    /// Sole Mates WP #30 test seams (HistoricalRouteRescan.swift). Same
+    /// reasoning as the Stage F seams above: historical HKSampleQuery
+    /// enumeration and HKWorkoutRoute lookup both require a real,
+    /// populated HealthKit store this test target never has. Production
+    /// leaves both nil.
+    internal var historicalRescanEnumerationOverrideForTests:
+        ((Date?, Date?, Int, @escaping (Bool, [HKWorkout], Date?, Bool) -> Void) -> Void)?
+    internal var historicalRescanRouteLookupOverrideForTests: ((HKWorkout, @escaping ([[String: Any]]?) -> Void) -> Void)?
+
     #if DEBUG
     /// Map Roadmap #27 Stage F bounded real-device proof ONLY - see
     /// `armForcedRouteFetchMiss`. `#if DEBUG` means this property, and
