@@ -24,6 +24,34 @@ final class OpenWearablesHealthSDKTests: XCTestCase {
         XCTAssertNotNil(sdk.isSessionValid)
     }
     
+    /// WP #30 Apple Health historical GPS recovery pilot-prep (2026-10-08)
+    /// — setSyncDaysBack must do exactly one thing: persist the value
+    /// syncStartDate() reads. It must never touch sync state (hasResumableSession/
+    /// sentCount/completedTypes/isFullExport unchanged) — unlike
+    /// startBackgroundSync(syncDaysBack:), which also starts monitoring and
+    /// kicks off a real sync round. This is what makes it safe to call
+    /// immediately before startHistoricalRouteRescan without incidentally
+    /// running an extra ordinary sync pass over the widened window.
+    func testSetSyncDaysBackOnlyPersistsTheValueNoOtherSideEffect() {
+        let sdk = OpenWearablesHealthSDK.shared
+        let statusBefore = sdk.getSyncStatus()
+
+        sdk.setSyncDaysBack(30)
+        let thirtyDayStart = sdk.syncStartDate()
+
+        sdk.setSyncDaysBack(7)
+        let sevenDayStart = sdk.syncStartDate()
+
+        XCTAssertNotNil(thirtyDayStart)
+        XCTAssertNotNil(sevenDayStart)
+        XCTAssertLessThan(thirtyDayStart!, sevenDayStart!, "a 30-day window must start earlier than a 7-day window")
+
+        let statusAfter = sdk.getSyncStatus()
+        XCTAssertEqual(statusBefore["hasResumableSession"] as? Bool, statusAfter["hasResumableSession"] as? Bool)
+        XCTAssertEqual(statusBefore["sentCount"] as? Int, statusAfter["sentCount"] as? Int)
+        XCTAssertEqual(statusBefore["isFullExport"] as? Bool, statusAfter["isFullExport"] as? Bool)
+    }
+
     func testGetSyncStatusReturnsValidStructure() {
         let sdk = OpenWearablesHealthSDK.shared
         let status = sdk.getSyncStatus()

@@ -663,7 +663,30 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let startOfToday = calendar.startOfDay(for: Date())
         return calendar.date(byAdding: .day, value: -daysBack, to: startOfToday) ?? startOfToday
     }
-    
+
+    /// WP #30 Apple Health historical GPS recovery pilot-prep (2026-10-08)
+    /// — a side-effect-free way to change the persisted `syncDaysBack`
+    /// value `syncStartDate()` reads, for a caller that needs to widen
+    /// the historical-rescan window WITHOUT also triggering an ordinary
+    /// sync round. `startBackgroundSync(syncDaysBack:completion:)` is the
+    /// only other public way to change this value, but it ALSO registers
+    /// HealthKit observers, starts network/protected-data/foreground
+    /// monitoring, and immediately kicks off a real sync round
+    /// (`initialSyncKickoff`) over whatever window it was just given —
+    /// calling it just to widen the window for `startHistoricalRouteRescan`
+    /// would incidentally run an extra, unrequested ordinary sync pass
+    /// over the widened range. This method does exactly one thing: writes
+    /// the Keychain value. It never touches HealthKit, never starts or
+    /// stops monitoring, never schedules anything, and never runs a sync.
+    /// A caller widening the window for one `startHistoricalRouteRescan()`
+    /// call is responsible for calling this again afterward to restore
+    /// whatever value ordinary sync on this device actually uses — this
+    /// method has no memory of what that was.
+    public func setSyncDaysBack(_ days: Int) {
+        OpenWearablesHealthSdkKeychain.saveSyncDaysBack(days)
+        logMessage("syncDaysBack set to \(days) (setSyncDaysBack — no sync triggered)")
+    }
+
     /// Start background sync (registers HealthKit observers, schedules BG tasks, triggers initial sync).
     ///
     /// - Parameters:
