@@ -44,13 +44,21 @@ import HealthKit
 final class DurationIndependentDiscoveryTests: XCTestCase {
 
     private static let sdkSourceURL: URL = {
-        // This test file's own location: Tests/OpenWearablesHealthSDKTests/.
-        // The main source lives at Sources/OpenWearablesHealthSDK/OpenWearablesHealthSDK.swift,
-        // a fixed, known relative path from here.
+        // #filePath (this file) resolves, at the point the TEST BINARY was
+        // compiled, to .../open_wearables_ios_sdk/Tests/OpenWearablesHealthSDKTests/DurationIndependentDiscoveryTests.swift.
+        // Three levels up reaches the package root; from there the main
+        // source lives at the fixed, known relative path
+        // Sources/OpenWearablesHealthSDK/OpenWearablesHealthSDK.swift.
+        // (Confirmed by running test-without-building directly: the
+        // original two-levels-up version pointed at
+        // .../Tests/Sources/OpenWearablesHealthSDK/... and failed with
+        // "No such file or directory" on every structural test — a bug in
+        // this helper, not an execution-environment limitation.)
         let thisFile = URL(fileURLWithPath: #filePath)
         return thisFile
-            .deletingLastPathComponent() // OpenWearablesHealthSDKTests/
-            .deletingLastPathComponent() // Tests/
+            .deletingLastPathComponent() // removes the filename -> OpenWearablesHealthSDKTests/
+            .deletingLastPathComponent() // -> Tests/
+            .deletingLastPathComponent() // -> package root
             .appendingPathComponent("Sources/OpenWearablesHealthSDK/OpenWearablesHealthSDK.swift")
     }()
 
