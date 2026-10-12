@@ -1710,13 +1710,31 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         completion: @escaping (_ success: Bool, _ samples: [HKSample], _ newAnchor: HKQueryAnchor?, _ anchorData: Data?, _ isDone: Bool) -> Void
     ) {
         if isSyncCancelled(generation: generation) { completion(false, [], nil, nil, false); return }
-        
-        let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
-            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        }()
-        
-        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: chunkLimit) {
+
+        // Duration-Independent Discovery WP (2026-10-12) — deliberately NO
+        // date predicate here. This is the ONGOING, anchor-driven
+        // incremental path (reached only after a full export has already
+        // completed and a real anchor exists — see
+        // collectAllDataForTypeAt's own "no anchor and full export not
+        // completed" guard above, unchanged). An HKAnchoredObjectQuery's
+        // whole purpose is to report every add/update/delete since the
+        // last anchor, independent of any sample's own startDate; adding
+        // a syncStartDate()-bound predicate here defeated that guarantee
+        // for exactly the activities this WP exists to fix — a 32-hour or
+        // 100-hour workout, or any workout whose own start predates
+        // syncDaysBack by the time it actually finishes or syncs, was
+        // silently excluded from every ordinary background sync, forever,
+        // regardless of how recently it was added to HealthKit. The
+        // bounded historical window (fetchOneChunkNewestFirst, used only
+        // for the explicit first-time full export and the explicit,
+        // manually-triggered historical rescan) is UNCHANGED and
+        // deliberately still bounded — this file's own "Do not introduce
+        // automatic unlimited historical imports" constraint applies to
+        // THAT path, not to this one. See captureAnchorStep's own matching
+        // change just below: the anchor baseline itself must be captured
+        // the same, unbounded way, or a poisoned/pre-existing anchor could
+        // still permanently skip the very same records.
+        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: chunkLimit) {
             [weak self] _, samplesOrNil, deletedObjects, newAnchor, error in
             autoreleasepool {
                 guard let self = self else { completion(false, [], nil, nil, false); return }
@@ -1773,11 +1791,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     private func captureAnchorStep(type: HKSampleType, anchor: HKQueryAnchor?, limit: Int, completion: @escaping (HKQueryAnchor?) -> Void) {
-        let syncPredicate: NSPredicate? = {
-            guard let start = syncStartDate() else { return nil }
-            return HKQuery.predicateForSamples(withStart: start, end: nil, options: [])
-        }()
-        let query = HKAnchoredObjectQuery(type: type, predicate: syncPredicate, anchor: anchor, limit: limit) {
+        // Duration-Independent Discovery WP (2026-10-12) — matches
+        // fetchOneChunkIncremental's own change, for the same reason: this
+        // step seeds the anchor baseline that EVERY later incremental
+        // query inherits. HealthKit's own anchor semantics for a
+        // predicate-scoped query are not something this codebase can
+        // verify without a real device/simulator run (no HealthKit test
+        // double exists in this suite — see SyncProgressTracingTests.swift's
+        // own header for the established precedent of relying on direct
+        // code review here instead). Rather than depend on an unverified
+        // assumption about whether the anchor's own position silently
+        // advances past records the OLD bounded predicate excluded, this
+        // seeds the anchor with no predicate at all, so there is no
+        // longer anything for that question to apply to. The historical
+        // full-export fetch itself (fetchOneChunkNewestFirst) remains
+        // deliberately bounded — only the anchor's own baseline changes
+        // here, not what full export fetches.
+        let query = HKAnchoredObjectQuery(type: type, predicate: nil, anchor: anchor, limit: limit) {
             [weak self] _, samples, deletedObjects, newAnchor, error in
             guard let self = self else { completion(nil); return }
             
