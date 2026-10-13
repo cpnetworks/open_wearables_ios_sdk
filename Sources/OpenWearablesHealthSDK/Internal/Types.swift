@@ -17,6 +17,13 @@ public enum HealthDataType: String, CaseIterable, Sendable {
     case steps
     case distanceWalkingRunning
     case distanceCycling
+    // Gate H.34 (2026-10-13) — added for Sole Mates' "swim" activity type;
+    // _buildWorkoutStats already tries .distanceSwimming internally (see
+    // that function's distanceTypes list below) but, before this case
+    // existed, no host app could actually request authorization for it
+    // through this SDK's public surface — swim distance was unreachable
+    // by construction, not merely unauthorized.
+    case distanceSwimming
     case flightsClimbed
     case walkingSpeed
     case walkingStepLength
@@ -114,6 +121,8 @@ public enum HealthDataType: String, CaseIterable, Sendable {
             return HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning)
         case .distanceCycling:
             return HKObjectType.quantityType(forIdentifier: .distanceCycling)
+        case .distanceSwimming:
+            return HKObjectType.quantityType(forIdentifier: .distanceSwimming)
         case .flightsClimbed:
             return HKObjectType.quantityType(forIdentifier: .flightsClimbed)
         case .walkingSpeed:
@@ -352,7 +361,8 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .restingHeartRate):
             return .count().unitDivided(by: .minute())
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return .meter()
         case HKObjectType.quantityType(forIdentifier: .bodyMass),
              HKObjectType.quantityType(forIdentifier: .height):
@@ -415,7 +425,8 @@ extension OpenWearablesHealthSDK {
              HKObjectType.quantityType(forIdentifier: .dietaryEnergyConsumed):
             return (.kilocalorie(), "Cal")
         case HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning),
-             HKObjectType.quantityType(forIdentifier: .distanceCycling):
+             HKObjectType.quantityType(forIdentifier: .distanceCycling),
+             HKObjectType.quantityType(forIdentifier: .distanceSwimming):
             return (.meter(), "m")
         case HKObjectType.quantityType(forIdentifier: .walkingSpeed):
             return (.meter().unitDivided(by: .second()), "m/s")

@@ -551,7 +551,13 @@ extension OpenWearablesHealthSDK {
         }
     }
 
-    private func fetchOneHistoricalWorkoutChunk(
+    /// Internal (not private) - Sole Mates H.32 (2026-10-13) shares this
+    /// exact enumeration, and its test seam
+    /// (`historicalRescanEnumerationOverrideForTests`), with
+    /// `HistoricalWorkoutStatsRescan.swift`. The HKWorkout enumeration
+    /// query itself has nothing route-specific about it; only what each
+    /// rescan does PER WORKOUT differs.
+    internal func fetchOneHistoricalWorkoutChunk(
         olderThan: Date?, lowerBound: Date?,
         completion: @escaping (Bool, [HKWorkout], Date?, Bool) -> Void
     ) {
