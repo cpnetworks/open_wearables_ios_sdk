@@ -621,6 +621,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// ```
     public func requestAuthorization(types: [HealthDataType], completion: @escaping (Bool) -> Void) {
         let effectiveTypes = Self.normalizedTypesForAuthorization(types)
+        let previouslyTrackedRawValues = Set(OpenWearablesHealthSdkKeychain.getTrackedTypes() ?? [])
+        let newlyRequestedTypes = Self.newlyRequestedTypes(
+            effectiveTypes: effectiveTypes, previouslyTrackedRawValues: previouslyTrackedRawValues
+        )
+
         self.trackedTypes = mapTypes(effectiveTypes)
         OpenWearablesHealthSdkKeychain.saveTrackedTypes(effectiveTypes.map { $0.rawValue })
 
@@ -628,7 +633,61 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
         requestAuthorizationInternal { ok in
             completion(ok)
+            if ok {
+                self.triggerStatsRescanIfPermissionsExpanded(newlyRequestedTypes: newlyRequestedTypes)
+            }
         }
+    }
+
+    /// Gate H.32 (2026-10-13) permission-expansion detection.
+    ///
+    /// HealthKit deliberately makes "did read authorization just expand?"
+    /// unanswerable by asking HealthKit itself:
+    /// `HKHealthStore.authorizationStatus(for:)`, for a READ type, cannot
+    /// reliably distinguish "denied" from "not yet determined" - Apple
+    /// does this on purpose so an app can never probe what a user is
+    /// hiding. This SDK never calls that API for this purpose and never
+    /// will; see `HistoricalWorkoutStatsRescan.swift`'s own doc comment.
+    ///
+    /// Instead this diffs what the HOST APP is asking for right now
+    /// against what it asked for last time - information this SDK
+    /// already owns (`OpenWearablesHealthSdkKeychain.getTrackedTypes()`),
+    /// requiring no HealthKit round-trip and no new permission of its
+    /// own to read.
+    ///
+    /// Fallback for "permission state cannot be determined": an EMPTY
+    /// previous list is treated as "nothing to compare against" (first
+    /// call ever, fresh install, or a genuinely cleared Keychain) and
+    /// returns no newly-requested types - deliberately NOT "everything
+    /// is newly granted," which would fire a bounded rescan on every
+    /// fresh sign-in for no reason. That also means this heuristic can
+    /// miss a real expansion it has no record of. The explicit,
+    /// always-available fallback that does not depend on this detection
+    /// at all is `startHistoricalWorkoutStatsRescan`, public and
+    /// independently callable at any time (e.g. a support-driven repair
+    /// for one specific user, as in Gate H.32) regardless of whether the
+    /// host app ever re-calls `requestAuthorization`.
+    internal static func newlyRequestedTypes(
+        effectiveTypes: [HealthDataType], previouslyTrackedRawValues: Set<String>
+    ) -> [HealthDataType] {
+        guard !previouslyTrackedRawValues.isEmpty else { return [] }
+        return effectiveTypes.filter { !previouslyTrackedRawValues.contains($0.rawValue) }
+    }
+
+    /// Conservative trigger: fires on any newly-requested type other than
+    /// `.workout`/`.workoutRoute` themselves (which unlock no additional
+    /// per-workout quantity statistic by themselves - the route rescan
+    /// already exists independently for `.workoutRoute`). Does not try
+    /// to maintain a second, duplicate list of exactly which types
+    /// `_buildWorkoutStats` reads - a newly-granted type this rescan
+    /// can't actually use just means the resend recovers nothing new for
+    /// that type, which is harmless and still bounded by the rescan's
+    /// own caps.
+    internal func triggerStatsRescanIfPermissionsExpanded(newlyRequestedTypes: [HealthDataType]) {
+        let meaningful = newlyRequestedTypes.filter { $0 != .workout && $0 != .workoutRoute }
+        guard !meaningful.isEmpty else { return }
+        logMessage("Authorization expanded (\(meaningful.count) new type(s)) - starting bounded historical workout-stats rescan")
+        startHistoricalWorkoutStatsRescan { _ in }
     }
 
     /// Ensures a route-only authorization request can never be constructed.
