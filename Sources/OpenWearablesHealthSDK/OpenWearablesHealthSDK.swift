@@ -930,7 +930,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// these are two different concerns with two different required answers.
     internal func getSyncableTypes() -> [HKSampleType] {
         let routeIdentifier = HKSeriesType.workoutRoute().identifier
-        return getQueryableTypes().filter { $0.identifier != routeIdentifier }
+        // GDPR-04 — workouts only (PayloadAllowlist.isSyncableIdentifier): the
+        // distance types requested for workout statistics are never synced as
+        // all-day samples.
+        return getQueryableTypes().filter { $0.identifier != routeIdentifier && PayloadAllowlist.isSyncableIdentifier($0.identifier) }
     }
 
     // MARK: - Internal: Sync

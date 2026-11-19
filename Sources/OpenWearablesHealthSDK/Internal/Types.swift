@@ -337,7 +337,8 @@ extension OpenWearablesHealthSDK {
             payload["syncSessionId"] = attribution.sessionId
             payload["syncType"] = attribution.syncType
         }
-        return payload
+        // GDPR-04 — on-device allowlist; the single choke point every upload path uses.
+        return PayloadAllowlist.apply(payload)
     }
     
     // MARK: - Type mapping
