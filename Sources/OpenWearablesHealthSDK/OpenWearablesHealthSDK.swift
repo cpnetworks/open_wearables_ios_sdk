@@ -414,6 +414,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         super.init()
         // Fresh BGTask processes never see `configure` before the first refresh.
         self.host = OpenWearablesHealthSdkKeychain.getHost()
+
+        // Every process start (foreground, HealthKit wake, BGTask, background
+        // URLSession relaunch): keep SDK state out of device backups.
+        prepareStateStorage()
         
         let bgCfg = URLSessionConfiguration.background(withIdentifier: bgSessionId)
         bgCfg.isDiscretionary = false

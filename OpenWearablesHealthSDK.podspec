@@ -14,5 +14,6 @@ Pod::Spec.new do |s|
   s.platform     = :ios, '15.0'
   s.swift_version = '5.0'
   s.source_files = 'Sources/OpenWearablesHealthSDK/**/*.swift'
+  s.resource_bundles = { 'OpenWearablesHealthSDK_Privacy' => ['Sources/OpenWearablesHealthSDK/Resources/PrivacyInfo.xcprivacy'] }
   s.frameworks   = 'HealthKit', 'BackgroundTasks', 'UIKit'
 end

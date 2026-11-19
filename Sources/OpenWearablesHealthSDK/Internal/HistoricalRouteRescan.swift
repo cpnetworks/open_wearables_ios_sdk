@@ -211,7 +211,7 @@ extension OpenWearablesHealthSDK {
 
     private func saveHistoricalRescanProgress(_ progress: HistoricalRescanProgress) {
         guard let data = try? JSONEncoder().encode(progress) else { return }
-        try? data.write(to: historicalRescanStateFileURL(), options: .atomic)
+        writeStateFile(data, to: historicalRescanStateFileURL())
     }
 
     // MARK: - Public control surface

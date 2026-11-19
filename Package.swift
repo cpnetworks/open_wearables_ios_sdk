@@ -11,6 +11,9 @@ let package = Package(
         .target(
             name: "OpenWearablesHealthSDK",
             path: "Sources/OpenWearablesHealthSDK",
+            resources: [
+                .copy("Resources/PrivacyInfo.xcprivacy"),
+            ],
             linkerSettings: [
                 .linkedFramework("HealthKit"),
                 .linkedFramework("BackgroundTasks"),

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+* **SDK state excluded from device backups** (privacy): `health_sync_state/`, the legacy `health_outbox/` (only if still present; never re-created) and the three state files the SDK writes into Application Support (`pending_apple_route_retries.json`, `historical_route_rescan_state.json`, `historical_workout_stats_rescan_state.json`) now carry `isExcludedFromBackup`, re-applied on every process start and after every atomic write. They are also written with `.completeUntilFirstUserAuthentication`, the strictest class that still works for HealthKit background delivery and `BGTask` runs while the device is locked. The host app's own Application Support directory is never excluded. App Review Guideline 5.1.3(ii): no personal health information in iCloud.
+* **Privacy manifest**: the SDK ships its own `PrivacyInfo.xcprivacy` as a package resource (and CocoaPods resource bundle). Collected: Health, Fitness, Precise Location (workout routes), Other Diagnostic Data (sync logs), linked, App Functionality, no tracking. Required-reason APIs: UserDefaults `CA92.1`, File timestamp `C617.1`.
+
 ## 0.18.0
 
 * **Route retry terminal semantics corrected** (Map Roadmap #27 Stage G): a bounded real-device proof of Stage F's retry mechanism showed attempt count was being conflated with evidence of genuine route absence — with opportunistic triggers firing as often as device-unlock/foreground, the original "4 attempts" cap could exhaust in well under an hour, nowhere near the 24h window it was meant to bound. Attempt count now governs ONLY retry cadence (the same 15s/1m/5m/30m early floors, then a flat ~hourly floor once those are exhausted — frequent triggers inside that hour are a no-op, never reaching HealthKit); wall-clock age since the first miss is now the ONLY terminal criterion, unchanged at 24h. A protected-data-unavailable or network/auth-failure skip still never advances the attempt clock and never counts toward termination.

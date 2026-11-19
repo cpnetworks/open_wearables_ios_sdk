@@ -42,8 +42,10 @@ extension OpenWearablesHealthSDK {
         return stateBaseDirectory().appendingPathComponent("health_sync_state", isDirectory: true)
     }
     
+    /// Re-creates the directory if it was removed and re-applies backup
+    /// exclusion and file protection (see StateStorage.swift).
     internal func ensureSyncStateDir() {
-        try? FileManager.default.createDirectory(at: syncStateDir(), withIntermediateDirectories: true)
+        prepareStateStorage()
     }
     
     internal func syncStateFilePath() -> URL {
@@ -59,7 +61,7 @@ extension OpenWearablesHealthSDK {
     internal func saveSyncState(_ state: SyncState) {
         ensureSyncStateDir()
         if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: syncStateFilePath(), options: .atomic)
+            writeStateFile(data, to: syncStateFilePath())
         }
     }
     

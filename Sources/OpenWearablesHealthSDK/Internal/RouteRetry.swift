@@ -91,7 +91,7 @@ extension OpenWearablesHealthSDK {
 
     private func savePendingRouteRetries(_ items: [PendingRouteRetry]) {
         guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: pendingRouteRetryFileURL(), options: .atomic)
+        writeStateFile(data, to: pendingRouteRetryFileURL())
     }
 
     /// Called only from `fetchRoutePayload`'s genuine-miss branch - never
